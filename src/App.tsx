@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { supabase } from './lib/supabase';
 import { Channel, Program } from './types';
-import { ChevronUp, ChevronDown, Info, Settings, Tv, Play, SkipForward, List } from 'lucide-react';
+import { ChevronUp, ChevronDown, Info, Settings, Tv, Play, SkipForward, List, Volume2, VolumeX } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import AdminPanel from './components/AdminPanel';
 import { cn } from './lib/utils';
@@ -26,6 +26,7 @@ export default function App() {
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(true);
   const [randomProgram, setRandomProgram] = useState<Program | null>(null);
+  const [isMuted, setIsMuted] = useState(false);
   const overlayTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const fetchChannels = useCallback(async () => {
@@ -124,8 +125,8 @@ export default function App() {
   const getEmbedUrl = (channel: Channel, program?: Program) => {
     if (!channel) return '';
     let baseUrl = 'https://www.youtube.com/embed/';
-    // Added mute=1 for more reliable autoplay across browsers
-    let params = '?autoplay=1&mute=1&controls=0&modestbranding=1&rel=0&showinfo=0&iv_load_policy=3&enablejsapi=1';
+    // Use isMuted state to control the URL parameter
+    let params = `?autoplay=1&mute=${isMuted ? 1 : 0}&controls=0&modestbranding=1&rel=0&showinfo=0&iv_load_policy=3&enablejsapi=1`;
 
     const activeProgram = program || randomProgram;
 
@@ -299,6 +300,17 @@ export default function App() {
                     className="w-12 h-12 sm:w-16 sm:h-16 bg-white/5 hover:bg-white/10 rounded-2xl flex items-center justify-center transition-all border border-white/5 group/btn hidden sm:flex"
                   >
                     <ChevronDown className="w-6 h-6 sm:w-8 sm:h-8 text-white group-hover/btn:scale-110 transition-transform" />
+                  </button>
+                  
+                  <button 
+                    onClick={(e) => { e.stopPropagation(); setIsMuted(!isMuted); }}
+                    className="w-12 h-12 sm:w-16 sm:h-16 bg-white/5 hover:bg-white/10 rounded-2xl flex items-center justify-center transition-all border border-white/5 group/btn"
+                  >
+                    {isMuted ? (
+                      <VolumeX className="w-6 h-6 sm:w-8 sm:h-8 text-white group-hover/btn:scale-110 transition-transform" />
+                    ) : (
+                      <Volume2 className="w-6 h-6 sm:w-8 sm:h-8 text-white group-hover/btn:scale-110 transition-transform" />
+                    )}
                   </button>
                   
                   {/* Channel Guide Button (Cable TV Feel) */}
