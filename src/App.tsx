@@ -27,6 +27,7 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [randomProgram, setRandomProgram] = useState<Program | null>(null);
   const [isMuted, setIsMuted] = useState(false);
+  const [isPoweredOn, setIsPoweredOn] = useState(false);
   const overlayTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const fetchChannels = useCallback(async () => {
@@ -175,6 +176,35 @@ export default function App() {
     );
   }
 
+  if (!isPoweredOn) {
+    return (
+      <div className="h-screen w-screen bg-black flex items-center justify-center">
+        <motion.div 
+          initial={{ scale: 0.9, opacity: 0 }}
+          animate={{ scale: 1, opacity: 1 }}
+          className="flex flex-col items-center gap-8"
+        >
+          <div className="w-24 h-24 bg-indigo-600/20 rounded-full flex items-center justify-center border border-indigo-500/30 shadow-[0_0_50px_rgba(79,70,229,0.2)]">
+            <Tv className="w-12 h-12 text-indigo-500" />
+          </div>
+          <div className="text-center space-y-2">
+            <h1 className="text-3xl font-black text-white tracking-tighter uppercase">YOUTV SMART</h1>
+            <p className="text-zinc-500 text-sm font-medium uppercase tracking-widest">Premium Cable Experience</p>
+          </div>
+          <button 
+            onClick={() => {
+              setIsPoweredOn(true);
+              triggerOverlay();
+            }}
+            className="px-10 py-4 bg-indigo-600 hover:bg-indigo-700 text-white rounded-2xl font-black uppercase tracking-widest transition-all hover:scale-105 active:scale-95 shadow-xl shadow-indigo-600/20 group flex items-center gap-3"
+          >
+            <Play className="w-5 h-5 fill-current" /> Power On
+          </button>
+        </motion.div>
+      </div>
+    );
+  }
+
   return (
     <div className="h-screen w-screen bg-black overflow-hidden relative group font-sans">
       {/* Video Player Background */}
@@ -184,8 +214,9 @@ export default function App() {
             key={`${currentChannel?.id}-${currentProgram?.id}`}
             src={embedUrl}
             className="w-full h-full aspect-video"
-            allow="autoplay; encrypted-media"
+            allow="autoplay; encrypted-media; picture-in-picture"
             allowFullScreen
+            frameBorder="0"
           />
         )}
       </div>
