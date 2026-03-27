@@ -1,5 +1,5 @@
 {
-  "name": "YOUTV",
-  "description": "A TV-style YouTube streaming app with channels, EPG, and admin panel.",
+  "name": "YouTV",
+  "description": "A cable TV-style experience powered by YouTube with real-time channel switching and EPG.",
   "requestFramePermissions": []
 }
