@@ -1,32 +1,55 @@
 const YOUTUBE_API_KEY = process.env.VITE_YOUTUBE_API_KEY || 'AIzaSyBHWwAE64yVDry6u_y1gF-c6-rRrs7Wzm4';
 
-export async function detectLiveVideoIds(channelId: string): Promise<string[]> {
+export async function detectLiveVideoIds(sourceId: string): Promise<string[]> {
   try {
-    // If it's a handle (@name), we first need to get the channel ID
-    let finalChannelId = channelId;
-    if (channelId.startsWith('@')) {
+    console.log(`Detecting live videos for source: ${sourceId}`);
+    let url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&eventType=live&maxResults=5&key=${YOUTUBE_API_KEY}`;
+    
+    if (sourceId.startsWith('@')) {
+      // If it's a handle (@name), we first need to get the channel ID
       const handleResponse = await fetch(
-        `https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&q=${encodeURIComponent(channelId)}&key=${YOUTUBE_API_KEY}`
+        `https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&q=${encodeURIComponent(sourceId)}&key=${YOUTUBE_API_KEY}`
       );
       const handleData = await handleResponse.json();
-      if (handleData.items && handleData.items.length > 0) {
-        finalChannelId = handleData.items[0].id.channelId;
-      } else {
+      
+      if (handleData.error) {
+        console.error("YouTube API Error (Handle Search):", handleData.error);
         return [];
       }
+
+      if (handleData.items && handleData.items.length > 0) {
+        const channelId = handleData.items[0].id.channelId;
+        console.log(`Resolved handle ${sourceId} to channelId: ${channelId}`);
+        url += `&channelId=${channelId}`;
+      } else {
+        console.warn(`Could not resolve handle: ${sourceId}`);
+        return [];
+      }
+    } else if (sourceId.length === 24 && sourceId.startsWith('UC')) {
+      // It's a standard YouTube channel ID
+      url += `&channelId=${sourceId}`;
+    } else {
+      // It's likely a search query or a legacy username
+      // We'll use it as a query parameter
+      url += `&q=${encodeURIComponent(sourceId)}`;
     }
 
-    // Search for active live streams for this channel
-    const response = await fetch(
-      `https://www.googleapis.com/youtube/v3/search?part=snippet&channelId=${finalChannelId}&type=video&eventType=live&key=${YOUTUBE_API_KEY}`
-    );
-    
+    console.log(`Fetching live streams from: ${url.replace(YOUTUBE_API_KEY, 'REDACTED_KEY')}`);
+    const response = await fetch(url);
     const data = await response.json();
     
-    if (data.items && data.items.length > 0) {
-      return data.items.map((item: any) => item.id.videoId);
+    if (data.error) {
+      console.error("YouTube API Error (Live Search):", data.error);
+      return [];
     }
     
+    if (data.items && data.items.length > 0) {
+      const videoIds = data.items.map((item: any) => item.id.videoId);
+      console.log(`Found ${videoIds.length} live videos for ${sourceId}:`, videoIds);
+      return videoIds;
+    }
+    
+    console.log(`No live videos found for ${sourceId}`);
     return [];
   } catch (error) {
     console.error("Error detecting live videos with YouTube API:", error);
@@ -116,5 +139,29 @@ export async function getVideoDetails(videoId: string): Promise<any | null> {
   } catch (error) {
     console.error("Error getting video details:", error);
     return null;
+  }
+}
+
+export async function isVideoLive(videoId: string): Promise<boolean> {
+  try {
+    const response = await fetch(
+      `https://www.googleapis.com/youtube/v3/videos?part=snippet,liveStreamingDetails&id=${videoId}&key=${YOUTUBE_API_KEY}`
+    );
+    const data = await response.json();
+    
+    if (data.items && data.items.length > 0) {
+      const video = data.items[0];
+      // If it's a live stream, it should have liveStreamingDetails
+      // and NOT have an actualEndTime
+      if (video.liveStreamingDetails) {
+        return !video.liveStreamingDetails.actualEndTime;
+      }
+      // If it's not a live stream at all, it's not "live" for our purposes
+      return false;
+    }
+    return false;
+  } catch (error) {
+    console.error("Error checking if video is live:", error);
+    return false;
   }
 }

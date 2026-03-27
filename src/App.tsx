@@ -1,11 +1,11 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { supabase } from './lib/supabase';
-import { Channel, Program } from './types';
+import { Channel, Program, ScheduledProgram } from './types';
 import { cn } from './lib/utils';
-import { format, isWithinInterval, parseISO, differenceInSeconds } from 'date-fns';
+import { format, isWithinInterval } from 'date-fns';
 import { YouTubeCompliantAd } from './components/Ads/YouTubeCompliantAd';
 import { useVideoResize } from './hooks/useVideoResize';
-import { detectLiveVideoIds, fetchPlaylistVideos, searchVideos, getVideoDetails, getBatchVideoDetails } from './services/youtubeService';
+import { detectLiveVideoIds, fetchPlaylistVideos, searchVideos, getVideoDetails, getBatchVideoDetails, isVideoLive } from './services/youtubeService';
 import { 
   Tv, 
   Settings, 
@@ -45,7 +45,7 @@ export default function App() {
   const [channels, setChannels] = useState<Channel[]>([]);
   const [programs, setPrograms] = useState<Program[]>([]);
   const [currentChannel, setCurrentChannel] = useState<Channel | null>(null);
-  const [currentProgram, setCurrentProgram] = useState<Program | null>(null);
+  const [currentProgram, setCurrentProgram] = useState<ScheduledProgram | null>(null);
   const [isAdmin, setIsAdmin] = useState(false);
   const [showAdminPanel, setShowAdminPanel] = useState(false);
   const [showPasswordModal, setShowPasswordModal] = useState(false);
@@ -132,10 +132,10 @@ export default function App() {
     return hours * 3600 + minutes * 60 + seconds;
   };
 
-  const calculateStartTime = (startTimeStr: string) => {
-    const start = parseISO(startTimeStr);
+  const calculateStartTime = (startTime: Date, title?: string) => {
+    if (title === "LIVE BROADCAST") return 0;
     const now = new Date();
-    const diffSeconds = Math.floor((now.getTime() - start.getTime()) / 1000);
+    const diffSeconds = Math.floor((now.getTime() - startTime.getTime()) / 1000);
     return Math.max(0, diffSeconds);
   };
 
@@ -542,7 +542,7 @@ export default function App() {
         .from('programs')
         .select('*')
         .eq('channel_id', currentChannel.id)
-        .order('start_time', { ascending: true });
+        .order('created_at', { ascending: true });
       
       if (error) {
         setError(error.message);
@@ -554,8 +554,7 @@ export default function App() {
         channel_id: p.channel_id,
         title: p.title,
         video_id: p.video_id,
-        start_time: p.start_time,
-        end_time: p.end_time,
+        duration: p.duration,
         description: p.description,
         created_at: p.created_at
       } as Program));
@@ -580,23 +579,40 @@ export default function App() {
     };
   }, [currentChannel]);
 
+  const scheduledPrograms = useMemo<ScheduledProgram[]>(() => {
+    // If channel is live and has a live_video_id, that's the only program
+    if (currentChannel?.is_live && currentChannel?.live_video_id) {
+      const now = new Date();
+      return [{
+        id: 'live-' + currentChannel.id,
+        channel_id: currentChannel.id,
+        title: 'LIVE BROADCAST',
+        video_id: currentChannel.live_video_id,
+        duration: 86400, // 24 hours
+        start: new Date(now.getTime() - 12 * 60 * 60 * 1000), // Start 12 hours ago
+        end: new Date(now.getTime() + 12 * 60 * 60 * 1000), // End 12 hours from now
+        created_at: new Date().toISOString()
+      }];
+    }
+
+    if (programs.length === 0) return [];
+    const sorted = [...programs].sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+    let lastEndTime = new Date(sorted[0].created_at);
+    return sorted.map(p => {
+      const start = lastEndTime;
+      const end = new Date(start.getTime() + p.duration * 1000);
+      lastEndTime = end;
+      return { ...p, start, end };
+    });
+  }, [programs, currentChannel]);
+
   // --- EPG Logic ---
   useEffect(() => {
     const interval = setInterval(() => {
-      const now = new Date();
+      if (scheduledPrograms.length === 0) return;
       
-      // Prioritize programs with "LIVE" in the title if the channel is marked as live
-      const active = programs.sort((a, b) => {
-        const aIsLive = a.title.toUpperCase().includes('LIVE');
-        const bIsLive = b.title.toUpperCase().includes('LIVE');
-        if (aIsLive && !bIsLive) return -1;
-        if (!aIsLive && bIsLive) return 1;
-        return 0;
-      }).find(p => {
-        const start = parseISO(p.start_time);
-        const end = parseISO(p.end_time);
-        return isWithinInterval(now, { start, end });
-      });
+      const now = new Date();
+      const active = scheduledPrograms.find(p => isWithinInterval(now, { start: p.start, end: p.end }));
       
       if (active) {
         if (active.id !== currentProgram?.id) {
@@ -605,7 +621,7 @@ export default function App() {
             console.log("Loading new program:", active.title, "Video ID:", active.video_id);
             player.loadVideoById({
               videoId: active.video_id,
-              startSeconds: calculateStartTime(active.start_time)
+              startSeconds: calculateStartTime(active.start, active.title)
             });
             if (!isMuted) {
               player.unMute();
@@ -630,47 +646,36 @@ export default function App() {
     }, 1000);
 
     return () => clearInterval(interval);
-  }, [programs, currentProgram, player]);
+  }, [scheduledPrograms, currentProgram, player, hasInteracted, isMuted]);
 
   // --- Periodic Live Sync ---
   useEffect(() => {
     // Sync every 15 minutes
     const interval = setInterval(() => {
       syncLiveStatus();
-      channels.forEach(channel => {
-        if (!channel.is_live) syncChannelPrograms(channel);
-      });
     }, 15 * 60 * 1000);
 
     // Initial sync after 2 seconds to let data load
     const timeout = setTimeout(() => {
       syncLiveStatus();
-      // Also sync programs for all channels
-      channels.forEach(channel => {
-        if (!channel.is_live) syncChannelPrograms(channel);
-      });
     }, 2000);
 
     return () => {
       clearInterval(interval);
       clearTimeout(timeout);
     };
-  }, [channels]);
+  }, []); // Empty dependency array to prevent infinite loops
 
   useEffect(() => {
-    if (hasInteracted && !currentProgram && programs.length > 0) {
+    if (hasInteracted && !currentProgram && scheduledPrograms.length > 0) {
       const now = new Date();
-      const active = programs.find(p => {
-        const start = parseISO(p.start_time);
-        const end = parseISO(p.end_time);
-        return isWithinInterval(now, { start, end });
-      });
+      const active = scheduledPrograms.find(p => isWithinInterval(now, { start: p.start, end: p.end }));
       if (active) {
         setCurrentProgram(active);
         if (player && player.loadVideoById) {
           player.loadVideoById({
             videoId: active.video_id,
-            startSeconds: calculateStartTime(active.start_time)
+            startSeconds: calculateStartTime(active.start, active.title)
           });
           if (!isMuted) {
             player.unMute();
@@ -681,7 +686,7 @@ export default function App() {
         }
       }
     }
-  }, [hasInteracted, programs, player]);
+  }, [hasInteracted, scheduledPrograms, player]);
 
   // --- Overlay Visibility on Interaction ---
   useEffect(() => {
@@ -798,32 +803,11 @@ export default function App() {
         await supabase.from('channels').update({ live_video_id: null, is_live: false }).eq('id', currentProgram.channel_id);
         setError(`Live stream error. Skipping to next channel...`);
         switchChannel('next');
-      } else if (currentChannel) {
-        // For non-live, skip to next program by shifting its start time to now
-        const { data: next } = await supabase
-          .from('programs')
-          .select('*')
-          .eq('channel_id', currentChannel.id)
-          .gt('start_time', currentProgram.start_time)
-          .order('start_time', { ascending: true })
-          .limit(1);
-        
-        if (next && next.length > 0) {
-          const nextProg = next[0];
-          const duration = differenceInSeconds(parseISO(nextProg.end_time), parseISO(nextProg.start_time));
-          const now = new Date();
-          const newEndTime = new Date(now.getTime() + duration * 1000);
-          
-          await supabase.from('programs').update({
-            start_time: now.toISOString(),
-            end_time: newEndTime.toISOString()
-          }).eq('id', nextProg.id);
-          setError(`Video error. Skipping to next program...`);
-        } else {
-          setError(`Playback error. Skipping to next channel...`);
-          switchChannel('next');
-        }
-        
+      } else if (currentChannel && currentProgram) {
+        // For non-live, skip to next program by deleting the current one
+        // In a duration-based system, deleting the current one shifts the next one forward
+        await deleteProgram(currentProgram.id);
+        setError(`Video error. Skipping to next program...`);
         syncChannelPrograms(currentChannel);
       }
     } else {
@@ -854,7 +838,16 @@ export default function App() {
     setShowChannelList(false);
     
     // Refresh EPG for the new channel immediately
-    if (!channel.is_live) syncChannelPrograms(channel);
+    if (!channel.is_live && !channel.live_video_id) {
+      syncChannelPrograms(channel).then(() => {
+        // If still no programs after sync, try live sync
+        supabase.from('programs').select('id').eq('channel_id', channel.id).limit(1).then(({ data }) => {
+          if (!data || data.length === 0) {
+            syncLiveStatus();
+          }
+        });
+      });
+    }
     
     setTimeout(() => {
       setIsZapping(false);
@@ -899,8 +892,8 @@ export default function App() {
       setBatchTotal(videoIds.length);
 
       if (videoIds.length === 0) {
-        setError("No valid YouTube links found.");
         setIsBatchAdding(false);
+        alert("Successfully added 0 programs to the schedule.");
         return;
       }
 
@@ -908,36 +901,20 @@ export default function App() {
       const allVideoDetails = await getBatchVideoDetails(videoIds);
       
       // Phase 3: Prepare batch insert
-      const { data: lastProg } = await supabase
-        .from('programs')
-        .select('end_time')
-        .eq('channel_id', channelId)
-        .order('end_time', { ascending: false })
-        .limit(1);
-      
-      let lastEndTime = lastProg && lastProg.length > 0 
-        ? new Date(lastProg[0].end_time) 
-        : new Date();
-
       const batchToInsert = [];
       for (let i = 0; i < allVideoDetails.length; i++) {
         const details = allVideoDetails[i];
         const durationStr = details.contentDetails?.duration || 'PT10M';
         const durationSeconds = parseISO8601Duration(durationStr);
         
-        const startTime = lastEndTime;
-        const endTime = new Date(startTime.getTime() + durationSeconds * 1000);
-
         batchToInsert.push({
           channel_id: channelId,
           title: details.snippet.title,
           video_id: details.id,
-          start_time: startTime.toISOString(),
-          end_time: endTime.toISOString(),
+          duration: durationSeconds,
           description: details.snippet.description
         });
 
-        lastEndTime = endTime;
         setBatchProgress(i + 1);
       }
 
@@ -1034,28 +1011,43 @@ export default function App() {
     alert('Parental PIN updated successfully.');
   };
 
+  const getScheduledProgramsForChannel = useCallback((channelId: string, channelPrograms: Program[]): ScheduledProgram[] => {
+    if (channelPrograms.length === 0) return [];
+    const sorted = [...channelPrograms].sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+    let lastEndTime = new Date(sorted[0].created_at);
+    return sorted.map(p => {
+      const start = lastEndTime;
+      const end = new Date(start.getTime() + p.duration * 1000);
+      lastEndTime = end;
+      return { ...p, start, end };
+    });
+  }, []);
+
+  const getActiveProgramForChannel = useCallback((channelId: string): ScheduledProgram | undefined => {
+    const channelPrograms = programs.filter(p => p.channel_id === channelId);
+    const scheduled = getScheduledProgramsForChannel(channelId, channelPrograms);
+    const now = new Date();
+    return scheduled.find(p => isWithinInterval(now, { start: p.start, end: p.end }));
+  }, [programs, getScheduledProgramsForChannel]);
+
   const syncChannelPrograms = async (channel: Channel) => {
-    if (channel.is_live) return;
+    // Only sync programs if not live and no live video ID exists
+    if (channel.is_live && channel.live_video_id) return;
 
     try {
-      // Get upcoming programs
-      const now = new Date();
-      const { data: upcoming, error: fetchError } = await supabase
+      // Get current programs
+      const { data: current, error: fetchError } = await supabase
         .from('programs')
         .select('*')
         .eq('channel_id', channel.id)
-        .gte('end_time', now.toISOString())
-        .order('start_time', { ascending: true });
+        .order('created_at', { ascending: true });
 
       if (fetchError) throw fetchError;
 
-      const count = upcoming?.length || 0;
+      const count = current?.length || 0;
       if (count >= 10) return;
 
       const needed = 10 - count;
-      let lastEndTime = count > 0 
-        ? new Date(upcoming![count - 1].end_time) 
-        : now;
 
       // Fetch videos from YouTube
       let videos: any[] = [];
@@ -1077,24 +1069,12 @@ export default function App() {
         const videoId = video.id?.videoId || video.contentDetails?.videoId || (typeof video.id === 'string' ? video.id : null);
         if (!videoId) continue;
 
-        // Get duration
-        const details = await getVideoDetails(videoId);
-        const durationStr = details?.contentDetails?.duration || 'PT10M';
-        const durationSeconds = parseISO8601Duration(durationStr);
-
-        const startTime = lastEndTime;
-        const endTime = new Date(startTime.getTime() + durationSeconds * 1000);
-
         await addProgram(
           channel.id,
           video.snippet.title,
           videoId,
-          startTime.toISOString(),
-          endTime.toISOString(),
           video.snippet.description
         );
-
-        lastEndTime = endTime;
       }
     } catch (err) {
       console.error("Error syncing channel programs:", err);
@@ -1115,7 +1095,7 @@ export default function App() {
     setShowComplianceModal(true);
   };
 
-  const syncLiveStatus = async () => {
+  const syncLiveStatus = async (force = false) => {
     if (isSyncing) return;
     setIsSyncing(true);
     setError(null);
@@ -1124,9 +1104,13 @@ export default function App() {
     let liveCount = 0;
     
     try {
+      console.log(`Starting live sync (force=${force})...`);
       // Get all channels to ensure we have the latest state
       const { data: allChannels } = await supabase.from('channels').select('*');
-      if (!allChannels) return;
+      if (!allChannels) {
+        console.log("No channels found in database.");
+        return;
+      }
 
       // Group channels by their source ID (channel_id, username, or query)
       // This helps us identify which channels belong to the same "source"
@@ -1146,10 +1130,29 @@ export default function App() {
         
         const mainChannel = relatedChannels[0]; // The oldest one is our "Primary"
         
-        // Priority channels like Kapamilya should always be scanned
-        const isPriority = mainChannel.name.toLowerCase().includes('kapamilya');
+        // --- QUOTA SAVING LOGIC ---
+        // Check if ANY of the related channels already have a live_video_id
+        const liveChannel = relatedChannels.find(c => c.is_live && c.live_video_id);
         
-        // Check for fallback programs (not "LIVE BROADCAST")
+        if (!force && liveChannel && liveChannel.live_video_id) {
+          // CHEAP CHECK: Is it still live?
+          console.log(`Checking if existing live stream for ${mainChannel.name} is still active: ${liveChannel.live_video_id}`);
+          const stillLive = await isVideoLive(liveChannel.live_video_id);
+          
+          if (stillLive) {
+            console.log(`Live stream for ${mainChannel.name} is still active. Skipping search.`);
+            liveCount++;
+            continue;
+          } else {
+            console.log(`Live stream for ${mainChannel.name} has ended. Will search for new streams.`);
+            // Mark it as not live so we can search again
+            await supabase.from('channels').update({ is_live: false, live_video_id: null }).eq('id', liveChannel.id);
+            liveChannel.is_live = false;
+            liveChannel.live_video_id = undefined;
+          }
+        }
+        
+        // Check for fallback programs (not "LIVE BROADCAST") for the main channel
         const { data: fallbackPrograms } = await supabase
           .from('programs')
           .select('id')
@@ -1159,12 +1162,16 @@ export default function App() {
 
         const hasFallback = fallbackPrograms && fallbackPrograms.length > 0;
 
-        // Skip if it has fallback and isn't priority (to save quota)
-        if (!isPriority && hasFallback) {
+        // Only trigger sync if both live videos and fallback programs are not available
+        // Exception: Priority channels like Kapamilya should always be scanned if they are currently live
+        const isPriority = mainChannel.name.toLowerCase().includes('kapamilya');
+        
+        if (!force && !isPriority && hasFallback) {
+          console.log(`Skipping sync for ${mainChannel.name} (has fallback programs)`);
           continue;
         }
         
-        console.log(`Syncing live status for ${mainChannel.name}...`);
+        console.log(`Searching for live streams for ${mainChannel.name} using sourceId: ${sourceId}...`);
         let liveVideoIds = await detectLiveVideoIds(sourceId);
         // Unique the IDs to prevent duplicates
         liveVideoIds = Array.from(new Set(liveVideoIds));
@@ -1215,28 +1222,6 @@ export default function App() {
                 live_video_id: liveVideoId
               })
               .eq('id', targetChannelId);
-              
-            // Ensure "LIVE BROADCAST" program exists
-            const now = new Date();
-            const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
-            
-            const { data: existingProg } = await supabase
-              .from('programs')
-              .select('*')
-              .eq('channel_id', targetChannelId)
-              .eq('video_id', liveVideoId)
-              .gte('end_time', now.toISOString());
-              
-            if (!existingProg || existingProg.length === 0) {
-              await addProgram(
-                targetChannelId, 
-                "LIVE BROADCAST", 
-                liveVideoId, 
-                now.toISOString(), 
-                tomorrow.toISOString(), 
-                "Current live stream detected automatically."
-              );
-            }
           }
 
           // Delete any extra sub-channels that are no longer needed
@@ -1303,6 +1288,8 @@ export default function App() {
           is_live: false
         }]);
       if (error) throw error;
+      // Trigger sync for the new channel
+      setTimeout(() => syncLiveStatus(), 1000);
     } catch (err: any) {
       setError(err.message);
     }
@@ -1322,16 +1309,19 @@ export default function App() {
     }
   };
 
-  const addProgram = async (channelId: string, title: string, videoId: string, start_time: string, end_time: string, description: string) => {
+  const addProgram = async (channelId: string, title: string, videoId: string, description: string) => {
     try {
+      const details = await getVideoDetails(videoId);
+      const durationStr = details?.contentDetails?.duration || 'PT10M';
+      const durationSeconds = parseISO8601Duration(durationStr);
+
       const { error } = await supabase
         .from('programs')
         .insert([{
           channel_id: channelId,
           title,
           video_id: videoId,
-          start_time: start_time,
-          end_time: end_time,
+          duration: durationSeconds,
           description
         }]);
       if (error) throw error;
@@ -1352,9 +1342,9 @@ export default function App() {
     }
   };
 
-  const nextProgram = programs
-    .filter(p => parseISO(p.start_time) > new Date())
-    .sort((a, b) => parseISO(a.start_time).getTime() - parseISO(b.start_time).getTime())[0];
+  const nextProgram = scheduledPrograms
+    .filter(p => p.start > new Date())
+    .sort((a, b) => a.start.getTime() - b.start.getTime())[0];
 
   // --- UI Components ---
   return (
@@ -1607,7 +1597,7 @@ export default function App() {
                 <div className="flex items-center gap-2">
                   <span className="px-2 py-0.5 bg-red-600 text-[8px] font-black rounded uppercase tracking-widest animate-pulse">Live</span>
                   <span className="text-white/40 font-bold text-xs uppercase tracking-widest">
-                    {currentProgram ? format(parseISO(currentProgram.start_time), 'HH:mm') : '--:--'}
+                    {currentProgram ? format(currentProgram.start, 'HH:mm') : '--:--'}
                   </span>
                 </div>
               </div>
@@ -1817,7 +1807,7 @@ export default function App() {
                           if (player && currentProgram) {
                             player.loadVideoById({
                               videoId: currentProgram.video_id,
-                              startSeconds: calculateStartTime(currentProgram.start_time)
+                              startSeconds: calculateStartTime(currentProgram.start)
                             });
                             player.playVideo();
                           }
@@ -1845,7 +1835,7 @@ export default function App() {
                         <Activity className={cn("w-3 h-3 text-white/40", isSyncing && "animate-spin")} />
                       </button>
                       <span className="text-white/40 font-bold text-sm uppercase tracking-widest">
-                        {currentProgram ? format(parseISO(currentProgram.start_time), 'HH:mm') : '--:--'}
+                        {currentProgram ? format(currentProgram.start, 'HH:mm') : '--:--'}
                       </span>
                     </div>
                   </div>
@@ -1857,7 +1847,7 @@ export default function App() {
                     {nextProgram && (
                       <div className="mt-2 flex items-center gap-2 text-[10px] font-black uppercase tracking-widest text-white/20">
                         <span className="text-white/40">Next:</span>
-                        <span>{format(parseISO(nextProgram.start_time), 'HH:mm')} - {nextProgram.title}</span>
+                        <span>{format(nextProgram.start, 'HH:mm')} - {nextProgram.title}</span>
                       </div>
                     )}
                   </div>
@@ -1878,7 +1868,7 @@ export default function App() {
                   <div className="text-right border-l border-white/10 pl-4">
                     <div className="text-[10px] font-black text-white/40 uppercase tracking-widest">Next Program</div>
                     <div className="font-bold text-sm">
-                      {programs.find(p => parseISO(p.start_time) > currentTime)?.title || 'End of Broadcast'}
+                      {scheduledPrograms.find(p => p.start > currentTime)?.title || 'End of Broadcast'}
                     </div>
                   </div>
                   <ChevronRight className="w-5 h-5 text-white/20" />
@@ -1943,10 +1933,7 @@ export default function App() {
                         "text-[10px] font-bold uppercase tracking-widest",
                         currentChannel?.id === channel.id ? "text-white/60" : "text-white/20"
                       )}>
-                        {programs.find(p => {
-                          const now = new Date();
-                          return isWithinInterval(now, { start: parseISO(p.start_time), end: parseISO(p.end_time) });
-                        })?.title || 'Off Air'}
+                        {getActiveProgramForChannel(channel.id)?.title || 'Off Air'}
                       </div>
                     </div>
                   </div>
@@ -1988,6 +1975,7 @@ export default function App() {
             >
               {channels.map((channel, idx) => {
                 const channelPrograms = programs.filter(p => p.channel_id === channel.id);
+                const scheduled = getScheduledProgramsForChannel(channel.id, channelPrograms);
                 const isFocused = focusedChannelIndex === idx;
                 return (
                   <div key={channel.id} className={cn(
@@ -2001,10 +1989,10 @@ export default function App() {
                       <h4 className="text-2xl font-black uppercase tracking-tighter">{channel.name}</h4>
                     </div>
                     <div className="flex gap-4 overflow-x-auto pb-4 -mb-4 no-scrollbar">
-                      {channelPrograms.length > 0 ? (
-                        channelPrograms.map(p => {
+                      {scheduled.length > 0 ? (
+                        scheduled.map(p => {
                           const now = new Date();
-                          const isActive = isWithinInterval(now, { start: parseISO(p.start_time), end: parseISO(p.end_time) });
+                          const isActive = isWithinInterval(now, { start: p.start, end: p.end });
                           return (
                             <div 
                               key={p.id}
@@ -2014,7 +2002,7 @@ export default function App() {
                               )}
                             >
                               <div className="text-xs font-black uppercase tracking-widest mb-2 opacity-60">
-                                {format(parseISO(p.start_time), 'HH:mm')} - {format(parseISO(p.end_time), 'HH:mm')}
+                                {format(p.start, 'HH:mm')} - {format(p.end, 'HH:mm')}
                               </div>
                               <div className="font-black text-lg uppercase tracking-tighter mb-2">{p.title}</div>
                               <p className="text-xs opacity-40 line-clamp-2">{p.description}</p>
@@ -2025,7 +2013,7 @@ export default function App() {
                         <div className="flex flex-col items-center gap-4 p-10 bg-white/5 rounded-3xl border border-dashed border-white/10">
                           <div className="text-white/20 font-bold italic">No programs scheduled</div>
                           <button 
-                            onClick={syncLiveStatus}
+                            onClick={() => syncLiveStatus(true)}
                             disabled={isSyncing}
                             className="px-6 py-2 bg-red-600 hover:bg-red-700 rounded-full text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-2"
                           >
@@ -2209,11 +2197,9 @@ export default function App() {
                         const channelId = (form.elements.namedItem('channelId') as HTMLSelectElement).value;
                         const title = (form.elements.namedItem('title') as HTMLInputElement).value;
                         const videoId = (form.elements.namedItem('videoId') as HTMLInputElement).value;
-                        const start = (form.elements.namedItem('start') as HTMLInputElement).value;
-                        const end = (form.elements.namedItem('end') as HTMLInputElement).value;
                         const desc = (form.elements.namedItem('desc') as HTMLTextAreaElement).value;
                         
-                        addProgram(channelId, title, videoId, new Date(start).toISOString(), new Date(end).toISOString(), desc);
+                        addProgram(channelId, title, videoId, desc);
                         form.reset();
                       }}
                     >
@@ -2232,16 +2218,6 @@ export default function App() {
                         <div className="space-y-2">
                           <label className="text-[10px] font-black text-white/40 uppercase tracking-[0.3em]">Video ID</label>
                           <input name="videoId" required className="w-full bg-white/5 border border-white/10 rounded-2xl p-6 text-xl font-bold focus:outline-none focus:border-red-600 transition-colors" />
-                        </div>
-                      </div>
-                      <div className="grid grid-cols-2 gap-6">
-                        <div className="space-y-2">
-                          <label className="text-[10px] font-black text-white/40 uppercase tracking-[0.3em]">Start Time</label>
-                          <input type="datetime-local" name="start" required className="w-full bg-white/5 border border-white/10 rounded-2xl p-6 text-xl font-bold focus:outline-none focus:border-red-600 transition-colors" />
-                        </div>
-                        <div className="space-y-2">
-                          <label className="text-[10px] font-black text-white/40 uppercase tracking-[0.3em]">End Time</label>
-                          <input type="datetime-local" name="end" required className="w-full bg-white/5 border border-white/10 rounded-2xl p-6 text-xl font-bold focus:outline-none focus:border-red-600 transition-colors" />
                         </div>
                       </div>
                       <div className="space-y-2">
@@ -2377,7 +2353,7 @@ export default function App() {
                         <div key={p.id} className="flex items-center justify-between p-6 bg-white/5 rounded-2xl border border-white/5">
                           <div className="min-w-0">
                             <div className="text-xl font-black uppercase tracking-tighter truncate">{p.title}</div>
-                            <div className="text-[10px] font-black text-white/40 uppercase tracking-widest">{format(parseISO(p.start_time), 'MMM d, HH:mm')}</div>
+                            <div className="text-[10px] font-black text-white/40 uppercase tracking-widest">Duration: {Math.floor(p.duration / 60)}m {p.duration % 60}s</div>
                           </div>
                           <button onClick={() => deleteProgram(p.id)} className="text-red-500 hover:text-red-400 p-2 shrink-0">
                             <Trash2 className="w-6 h-6" />

@@ -15,10 +15,14 @@ export interface Program {
   channel_id: string;
   title: string;
   video_id: string;
-  start_time: string;
-  end_time: string;
+  duration: number;
   description?: string;
   created_at: string;
+}
+
+export interface ScheduledProgram extends Program {
+  start: Date;
+  end: Date;
 }
 
 export enum OperationType {
