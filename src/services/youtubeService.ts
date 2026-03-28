@@ -18,6 +18,47 @@ function getApiKey(): string {
   return key;
 }
 
+export async function getNoApiVideoDetails(videoId: string): Promise<any | null> {
+  try {
+    const response = await fetch(`/api/youtube/metadata?videoId=${videoId}`);
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.error || `Server returned ${response.status}`);
+    }
+    const data = await response.json();
+    
+    // Map our server response to the YouTube API format expected by the app
+    return {
+      id: data.id,
+      snippet: {
+        title: data.title,
+        description: data.description,
+        thumbnails: {
+          default: { url: data.thumbnail }
+        }
+      },
+      contentDetails: {
+        duration: `PT${data.duration}S` // Convert seconds to ISO8601 duration
+      }
+    };
+  } catch (error: any) {
+    console.error("Error getting no-API video details:", error.message);
+    return null;
+  }
+}
+
+export async function getBatchNoApiVideoDetails(videoIds: string[]): Promise<any[]> {
+  const results = [];
+  // We'll fetch them sequentially to avoid overwhelming our server or YouTube
+  for (const id of videoIds) {
+    const details = await getNoApiVideoDetails(id);
+    if (details) results.push(details);
+    // Small delay to be polite
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
+  return results;
+}
+
 export async function detectLiveVideoIds(sourceId: string): Promise<string[]> {
   const apiKey = getApiKey();
   try {

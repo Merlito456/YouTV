@@ -5,7 +5,7 @@ import { cn } from './lib/utils';
 import { format, isWithinInterval } from 'date-fns';
 import { YouTubeCompliantAd } from './components/Ads/YouTubeCompliantAd';
 import { useVideoResize } from './hooks/useVideoResize';
-import { detectLiveVideoIds, fetchPlaylistVideos, searchVideos, getVideoDetails, getBatchVideoDetails, isVideoLive } from './services/youtubeService';
+import { detectLiveVideoIds, fetchPlaylistVideos, searchVideos, getVideoDetails, getBatchVideoDetails, isVideoLive, getNoApiVideoDetails, getBatchNoApiVideoDetails } from './services/youtubeService';
 import { 
   Tv, 
   Settings, 
@@ -911,11 +911,18 @@ export default function App() {
         return;
       }
 
-      console.log(`Found ${videoIds.length} unique video IDs. Fetching details...`);
+      console.log(`Found ${videoIds.length} unique video IDs. Fetching details (No-API)...`);
 
-      // Phase 2: Fetch all video details in batches of 50
-      const allVideoDetails = await getBatchVideoDetails(videoIds);
+      // Phase 2: Fetch all video details (No-API)
+      const allVideoDetails = await getBatchNoApiVideoDetails(videoIds);
       
+      if (allVideoDetails.length === 0 && videoIds.length > 0) {
+        console.log("No-API fetch failed, falling back to YouTube Data API...");
+        // Fallback to YouTube API if No-API fails
+        const fallbackDetails = await getBatchVideoDetails(videoIds);
+        allVideoDetails.push(...fallbackDetails);
+      }
+
       if (allVideoDetails.length === 0 && videoIds.length > 0) {
         setIsBatchAdding(false);
         alert(`Found ${videoIds.length} video IDs, but could not fetch details for any of them. This usually means your YouTube API quota is exceeded or the videos are private/deleted.`);
@@ -1381,7 +1388,15 @@ export default function App() {
         videoId = videoMatch[1];
       }
 
-      const details = await getVideoDetails(videoId);
+      // Try No-API first
+      let details = await getNoApiVideoDetails(videoId);
+      
+      // Fallback to YouTube Data API if No-API fails
+      if (!details) {
+        console.log("No-API fetch failed for single video, falling back to YouTube Data API...");
+        details = await getVideoDetails(videoId);
+      }
+
       if (!details) {
         console.warn(`Could not find details for video ID: ${videoId}. Using default duration.`);
       }
