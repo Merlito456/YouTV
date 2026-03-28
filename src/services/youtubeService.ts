@@ -1,14 +1,33 @@
-const YOUTUBE_API_KEY = process.env.VITE_YOUTUBE_API_KEY || 'AIzaSyBHWwAE64yVDry6u_y1gF-c6-rRrs7Wzm4';
+const API_KEYS = [
+  import.meta.env.VITE_YOUTUBE_API_KEY_1,
+  import.meta.env.VITE_YOUTUBE_API_KEY_2,
+  import.meta.env.VITE_YOUTUBE_API_KEY_3,
+  import.meta.env.VITE_YOUTUBE_API_KEY_4,
+  import.meta.env.VITE_YOUTUBE_API_KEY_5,
+  import.meta.env.VITE_YOUTUBE_API_KEY, // Fallback to original
+].filter(Boolean);
+
+let currentKeyIndex = 0;
+
+function getApiKey(): string {
+  if (API_KEYS.length === 0) {
+    return 'AIzaSyBHWwAE64yVDry6u_y1gF-c6-rRrs7Wzm4'; // Hardcoded fallback if nothing is set
+  }
+  const key = API_KEYS[currentKeyIndex];
+  currentKeyIndex = (currentKeyIndex + 1) % API_KEYS.length;
+  return key;
+}
 
 export async function detectLiveVideoIds(sourceId: string): Promise<string[]> {
+  const apiKey = getApiKey();
   try {
-    console.log(`Detecting live videos for source: ${sourceId}`);
-    let url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&eventType=live&maxResults=5&key=${YOUTUBE_API_KEY}`;
+    console.log(`Detecting live videos for source: ${sourceId} using key index ${currentKeyIndex}`);
+    let url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&eventType=live&maxResults=5&key=${apiKey}`;
     
     if (sourceId.startsWith('@')) {
       // If it's a handle (@name), we first need to get the channel ID
       const handleResponse = await fetch(
-        `https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&q=${encodeURIComponent(sourceId)}&key=${YOUTUBE_API_KEY}`
+        `https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&q=${encodeURIComponent(sourceId)}&key=${apiKey}`
       );
       const handleData = await handleResponse.json();
       
@@ -34,7 +53,7 @@ export async function detectLiveVideoIds(sourceId: string): Promise<string[]> {
       url += `&q=${encodeURIComponent(sourceId)}`;
     }
 
-    console.log(`Fetching live streams from: ${url.replace(YOUTUBE_API_KEY, 'REDACTED_KEY')}`);
+    console.log(`Fetching live streams from: ${url.replace(apiKey, 'REDACTED_KEY')}`);
     const response = await fetch(url);
     const data = await response.json();
     
@@ -58,12 +77,13 @@ export async function detectLiveVideoIds(sourceId: string): Promise<string[]> {
 }
 
 export async function fetchPlaylistVideos(playlistId: string, limit: number = 0): Promise<any[]> {
+  const apiKey = getApiKey();
   try {
     let allItems: any[] = [];
     let nextPageToken = "";
     
     do {
-      const url = `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet,contentDetails&playlistId=${playlistId}&maxResults=50&pageToken=${nextPageToken}&key=${YOUTUBE_API_KEY}`;
+      const url = `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet,contentDetails&playlistId=${playlistId}&maxResults=50&pageToken=${nextPageToken}&key=${apiKey}`;
       const response = await fetch(url);
       const data = await response.json();
       
@@ -88,6 +108,7 @@ export async function fetchPlaylistVideos(playlistId: string, limit: number = 0)
 }
 
 export async function getBatchVideoDetails(videoIds: string[]): Promise<any[]> {
+  const apiKey = getApiKey();
   try {
     const chunks = [];
     for (let i = 0; i < videoIds.length; i += 50) {
@@ -97,7 +118,7 @@ export async function getBatchVideoDetails(videoIds: string[]): Promise<any[]> {
     let allDetails: any[] = [];
     for (const chunk of chunks) {
       const response = await fetch(
-        `https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails&id=${chunk.join(',')}&key=${YOUTUBE_API_KEY}`
+        `https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails&id=${chunk.join(',')}&key=${apiKey}`
       );
       const data = await response.json();
       if (data.items) {
@@ -112,8 +133,9 @@ export async function getBatchVideoDetails(videoIds: string[]): Promise<any[]> {
 }
 
 export async function searchVideos(query: string, maxResults: number = 50, channelId?: string): Promise<any[]> {
+  const apiKey = getApiKey();
   try {
-    let url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=${maxResults}&key=${YOUTUBE_API_KEY}`;
+    let url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=${maxResults}&key=${apiKey}`;
     if (query) url += `&q=${encodeURIComponent(query)}`;
     if (channelId) url += `&channelId=${channelId}`;
     
@@ -127,9 +149,10 @@ export async function searchVideos(query: string, maxResults: number = 50, chann
 }
 
 export async function getVideoDetails(videoId: string): Promise<any | null> {
+  const apiKey = getApiKey();
   try {
     const response = await fetch(
-      `https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails&id=${videoId}&key=${YOUTUBE_API_KEY}`
+      `https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails&id=${videoId}&key=${apiKey}`
     );
     const data = await response.json();
     if (data.items && data.items.length > 0) {
@@ -143,9 +166,10 @@ export async function getVideoDetails(videoId: string): Promise<any | null> {
 }
 
 export async function isVideoLive(videoId: string): Promise<boolean> {
+  const apiKey = getApiKey();
   try {
     const response = await fetch(
-      `https://www.googleapis.com/youtube/v3/videos?part=snippet,liveStreamingDetails&id=${videoId}&key=${YOUTUBE_API_KEY}`
+      `https://www.googleapis.com/youtube/v3/videos?part=snippet,liveStreamingDetails&id=${videoId}&key=${apiKey}`
     );
     const data = await response.json();
     

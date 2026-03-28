@@ -875,17 +875,31 @@ export default function App() {
       
       // Phase 1: Collect all video IDs
       for (const line of lines) {
+        // Check if it's a playlist
         const playlistMatch = line.match(/[&?]list=([^&]+)/);
         if (playlistMatch) {
           const playlistId = playlistMatch[1];
+          console.log(`Fetching playlist: ${playlistId}`);
           const playlistVideos = await fetchPlaylistVideos(playlistId);
-          videoIds.push(...playlistVideos.map(v => v.contentDetails?.videoId || v.id?.videoId || v.id));
-        } else {
-          const videoMatch = line.match(/(?:v=|\/embed\/|\/watch\?v=|\/v\/|youtu\.be\/|\/shorts\/)([^#&?]*)/);
-          if (videoMatch && videoMatch[1]) {
-            videoIds.push(videoMatch[1]);
-          }
+          const ids = playlistVideos.map(v => v.contentDetails?.videoId || v.snippet?.resourceId?.videoId).filter(id => id);
+          videoIds.push(...ids);
+          continue;
         }
+
+        // Check if it's a standard URL
+        const videoMatch = line.match(/(?:v=|\/embed\/|\/watch\?v=|\/v\/|youtu\.be\/|\/shorts\/)([^#&?]*)/);
+        if (videoMatch && videoMatch[1] && videoMatch[1].length === 11) {
+          videoIds.push(videoMatch[1]);
+          continue;
+        }
+
+        // Check if it's a raw video ID (11 chars, no spaces)
+        if (line.length === 11 && !line.includes(' ')) {
+          videoIds.push(line);
+          continue;
+        }
+
+        console.warn(`Could not parse video ID from line: ${line}`);
       }
 
       videoIds = [...new Set(videoIds)];
@@ -893,13 +907,25 @@ export default function App() {
 
       if (videoIds.length === 0) {
         setIsBatchAdding(false);
-        alert("Successfully added 0 programs to the schedule.");
+        alert("Could not find any valid YouTube video IDs in the provided links.");
         return;
       }
+
+      console.log(`Found ${videoIds.length} unique video IDs. Fetching details...`);
 
       // Phase 2: Fetch all video details in batches of 50
       const allVideoDetails = await getBatchVideoDetails(videoIds);
       
+      if (allVideoDetails.length === 0 && videoIds.length > 0) {
+        setIsBatchAdding(false);
+        alert(`Found ${videoIds.length} video IDs, but could not fetch details for any of them. This usually means your YouTube API quota is exceeded or the videos are private/deleted.`);
+        return;
+      }
+
+      if (allVideoDetails.length < videoIds.length) {
+        console.warn(`Only fetched details for ${allVideoDetails.length} out of ${videoIds.length} videos.`);
+      }
+
       // Phase 3: Prepare batch insert
       const batchToInsert = [];
       for (let i = 0; i < allVideoDetails.length; i++) {
@@ -927,7 +953,8 @@ export default function App() {
       }
 
       setIsBatchAdding(false);
-      alert(`Successfully added ${batchToInsert.length} programs to the schedule.`);
+      const skipped = videoIds.length - allVideoDetails.length;
+      alert(`Successfully added ${batchToInsert.length} programs.${skipped > 0 ? ` (${skipped} videos were skipped as they couldn't be found on YouTube)` : ''}`);
     } catch (err: any) {
       console.error("Batch add error:", err);
       setError(`Batch add failed: ${err.message}`);
@@ -1102,6 +1129,10 @@ export default function App() {
     
     let syncCount = 0;
     let liveCount = 0;
+    const MAX_SYNC_PER_CYCLE = 10; // Limit syncs per cycle to save quota
+    const SYNC_COOLDOWN = 10 * 60 * 1000; // 10 minutes cooldown per channel
+    
+    const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
     
     try {
       console.log(`Starting live sync (force=${force})...`);
@@ -1109,6 +1140,7 @@ export default function App() {
       const { data: allChannels } = await supabase.from('channels').select('*');
       if (!allChannels) {
         console.log("No channels found in database.");
+        setIsSyncing(false);
         return;
       }
 
@@ -1123,7 +1155,19 @@ export default function App() {
         }
       });
 
-      for (const sourceId in sourceGroups) {
+      // Sort source groups by last_live_check to prioritize stale channels
+      const sortedSourceIds = Object.keys(sourceGroups).sort((a, b) => {
+        const lastA = sourceGroups[a][0].last_live_check ? new Date(sourceGroups[a][0].last_live_check).getTime() : 0;
+        const lastB = sourceGroups[b][0].last_live_check ? new Date(sourceGroups[b][0].last_live_check).getTime() : 0;
+        return lastA - lastB;
+      });
+
+      for (const sourceId of sortedSourceIds) {
+        if (syncCount >= MAX_SYNC_PER_CYCLE && !force) {
+          console.log(`Reached max sync limit (${MAX_SYNC_PER_CYCLE}) for this cycle. Stopping.`);
+          break;
+        }
+
         const relatedChannels = sourceGroups[sourceId].sort((a, b) => 
           new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
         );
@@ -1131,7 +1175,15 @@ export default function App() {
         const mainChannel = relatedChannels[0]; // The oldest one is our "Primary"
         
         // --- QUOTA SAVING LOGIC ---
-        // Check if ANY of the related channels already have a live_video_id
+        // 1. Check cooldown
+        const lastCheck = mainChannel.last_live_check ? new Date(mainChannel.last_live_check).getTime() : 0;
+        const timeSinceLastCheck = Date.now() - lastCheck;
+        if (!force && timeSinceLastCheck < SYNC_COOLDOWN) {
+          console.log(`Skipping ${mainChannel.name} (checked ${Math.round(timeSinceLastCheck / 1000)}s ago, cooldown is 10m)`);
+          continue;
+        }
+
+        // 2. Check if ANY of the related channels already have a live_video_id
         const liveChannel = relatedChannels.find(c => c.is_live && c.live_video_id);
         
         if (!force && liveChannel && liveChannel.live_video_id) {
@@ -1142,6 +1194,8 @@ export default function App() {
           if (stillLive) {
             console.log(`Live stream for ${mainChannel.name} is still active. Skipping search.`);
             liveCount++;
+            // Update last_live_check even if we skip search
+            await supabase.from('channels').update({ last_live_check: new Date().toISOString() }).eq('id', mainChannel.id);
             continue;
           } else {
             console.log(`Live stream for ${mainChannel.name} has ended. Will search for new streams.`);
@@ -1152,7 +1206,7 @@ export default function App() {
           }
         }
         
-        // Check for fallback programs (not "LIVE BROADCAST") for the main channel
+        // 3. Check for fallback programs (not "LIVE BROADCAST") for the main channel
         const { data: fallbackPrograms } = await supabase
           .from('programs')
           .select('id')
@@ -1168,9 +1222,14 @@ export default function App() {
         
         if (!force && !isPriority && hasFallback) {
           console.log(`Skipping sync for ${mainChannel.name} (has fallback programs)`);
+          // Update last_live_check even if we skip search
+          await supabase.from('channels').update({ last_live_check: new Date().toISOString() }).eq('id', mainChannel.id);
           continue;
         }
         
+        // RATE LIMITING: Wait 1 second before each search
+        if (syncCount > 0) await delay(1000);
+
         console.log(`Searching for live streams for ${mainChannel.name} using sourceId: ${sourceId}...`);
         let liveVideoIds = await detectLiveVideoIds(sourceId);
         // Unique the IDs to prevent duplicates
@@ -1178,6 +1237,9 @@ export default function App() {
         
         syncCount++;
         
+        // Update last_live_check for the main channel
+        await supabase.from('channels').update({ last_live_check: new Date().toISOString() }).eq('id', mainChannel.id);
+
         if (liveVideoIds.length > 0) {
           console.log(`Found ${liveVideoIds.length} live stream(s) for ${mainChannel.name}`);
           
@@ -1309,9 +1371,21 @@ export default function App() {
     }
   };
 
-  const addProgram = async (channelId: string, title: string, videoId: string, description: string) => {
+  const addProgram = async (channelId: string, title: string, videoIdOrUrl: string, description: string) => {
     try {
+      let videoId = videoIdOrUrl.trim();
+      
+      // Extract video ID if a URL was provided
+      const videoMatch = videoId.match(/(?:v=|\/embed\/|\/watch\?v=|\/v\/|youtu\.be\/|\/shorts\/)([^#&?]*)/);
+      if (videoMatch && videoMatch[1] && videoMatch[1].length === 11) {
+        videoId = videoMatch[1];
+      }
+
       const details = await getVideoDetails(videoId);
+      if (!details) {
+        console.warn(`Could not find details for video ID: ${videoId}. Using default duration.`);
+      }
+
       const durationStr = details?.contentDetails?.duration || 'PT10M';
       const durationSeconds = parseISO8601Duration(durationStr);
 
@@ -1325,7 +1399,10 @@ export default function App() {
           description
         }]);
       if (error) throw error;
+      
+      alert(`Successfully scheduled "${title}"`);
     } catch (err: any) {
+      console.error("Add program error:", err);
       setError(err.message);
     }
   };
@@ -1549,7 +1626,7 @@ export default function App() {
                   Open Guide
                 </button>
                 <button 
-                  onClick={syncLiveStatus}
+                  onClick={() => syncLiveStatus()}
                   disabled={isSyncing}
                   className="px-6 py-2 bg-red-600 hover:bg-red-700 rounded-full text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-2"
                 >
@@ -1825,7 +1902,7 @@ export default function App() {
                         <Info className="w-3 h-3 text-white/40" />
                       </button>
                       <button 
-                        onClick={syncLiveStatus}
+                        onClick={() => syncLiveStatus()}
                         disabled={isSyncing}
                         className={cn(
                           "p-1 rounded-full hover:bg-white/10 transition-all"
@@ -2293,7 +2370,7 @@ export default function App() {
                 <div className="flex items-center justify-between border-l-8 border-red-600 pl-6">
                   <h3 className="text-2xl font-black uppercase tracking-tighter">Manage Content</h3>
                   <button 
-                    onClick={syncLiveStatus}
+                    onClick={() => syncLiveStatus()}
                     disabled={isSyncing}
                     className={cn(
                       "flex items-center gap-3 px-8 py-4 rounded-2xl font-black text-xs uppercase tracking-widest transition-all active:scale-95",

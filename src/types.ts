@@ -7,6 +7,7 @@ export interface Channel {
   channel_id?: string;
   is_live: boolean;
   live_video_id?: string;
+  last_live_check?: string;
   created_at: string;
 }
 
