@@ -4,6 +4,21 @@ const API_KEYS = [
   import.meta.env.VITE_YOUTUBE_API_KEY_3,
   import.meta.env.VITE_YOUTUBE_API_KEY_4,
   import.meta.env.VITE_YOUTUBE_API_KEY_5,
+  import.meta.env.VITE_YOUTUBE_API_KEY_6,
+  import.meta.env.VITE_YOUTUBE_API_KEY_7,
+  import.meta.env.VITE_YOUTUBE_API_KEY_8,
+  import.meta.env.VITE_YOUTUBE_API_KEY_9,
+  import.meta.env.VITE_YOUTUBE_API_KEY_10,
+  import.meta.env.VITE_YOUTUBE_API_KEY_11,
+  import.meta.env.VITE_YOUTUBE_API_KEY_12,
+  import.meta.env.VITE_YOUTUBE_API_KEY_13,
+  import.meta.env.VITE_YOUTUBE_API_KEY_14,
+  import.meta.env.VITE_YOUTUBE_API_KEY_15,
+  import.meta.env.VITE_YOUTUBE_API_KEY_16,
+  import.meta.env.VITE_YOUTUBE_API_KEY_17,
+  import.meta.env.VITE_YOUTUBE_API_KEY_18,
+  import.meta.env.VITE_YOUTUBE_API_KEY_19,
+  import.meta.env.VITE_YOUTUBE_API_KEY_20,
   import.meta.env.VITE_YOUTUBE_API_KEY, // Fallback to original
 ].filter(Boolean);
 
@@ -14,6 +29,7 @@ function getApiKey(): string {
     return 'AIzaSyBHWwAE64yVDry6u_y1gF-c6-rRrs7Wzm4'; // Hardcoded fallback if nothing is set
   }
   const key = API_KEYS[currentKeyIndex];
+  console.log(`[YouTube API] Using key index ${currentKeyIndex + 1} of ${API_KEYS.length}`);
   currentKeyIndex = (currentKeyIndex + 1) % API_KEYS.length;
   return key;
 }
