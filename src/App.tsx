@@ -5,7 +5,7 @@ import { cn } from './lib/utils';
 import { format, isWithinInterval } from 'date-fns';
 import { YouTubeCompliantAd } from './components/Ads/YouTubeCompliantAd';
 import { useVideoResize } from './hooks/useVideoResize';
-import { detectLiveVideoIds, fetchPlaylistVideos, searchVideos, getVideoDetails, getBatchVideoDetails, isVideoLive, getNoApiVideoDetails, getBatchNoApiVideoDetails } from './services/youtubeService';
+import { detectLiveVideoIds, fetchPlaylistVideos, searchVideos, getVideoDetails, getBatchVideoDetails, isVideoLive, getNoApiVideoDetails, getNoApiPlaylistVideos } from './services/youtubeService';
 import { 
   Tv, 
   Settings, 
@@ -880,22 +880,27 @@ export default function App() {
         if (playlistMatch) {
           const playlistId = playlistMatch[1];
           console.log(`Fetching playlist: ${playlistId}`);
-          const playlistVideos = await fetchPlaylistVideos(playlistId);
-          const ids = playlistVideos.map(v => v.contentDetails?.videoId || v.snippet?.resourceId?.videoId).filter(id => id);
-          videoIds.push(...ids);
-          continue;
+          
+          // Try No-API first
+          let ids = await getNoApiPlaylistVideos(playlistId);
+          
+          // Fallback to API if No-API failed
+          if (ids.length === 0) {
+            const playlistVideos = await fetchPlaylistVideos(playlistId);
+            ids = playlistVideos.map(v => v.contentDetails?.videoId || v.snippet?.resourceId?.videoId).filter(id => id);
+          }
+          
+          if (ids.length > 0) {
+            videoIds.push(...ids);
+            continue;
+          }
         }
 
-        // Check if it's a standard URL
-        const videoMatch = line.match(/(?:v=|\/embed\/|\/watch\?v=|\/v\/|youtu\.be\/|\/shorts\/)([^#&?]*)/);
-        if (videoMatch && videoMatch[1] && videoMatch[1].length === 11) {
+        // Check if it's a standard URL or raw ID
+        // Improved regex to handle more cases including raw IDs
+        const videoMatch = line.match(/(?:v=|\/embed\/|\/watch\?v=|\/v\/|youtu\.be\/|\/shorts\/|^)([a-zA-Z0-9_-]{11})(?:[#&?].*)?$/);
+        if (videoMatch && videoMatch[1]) {
           videoIds.push(videoMatch[1]);
-          continue;
-        }
-
-        // Check if it's a raw video ID (11 chars, no spaces)
-        if (line.length === 11 && !line.includes(' ')) {
-          videoIds.push(line);
           continue;
         }
 
@@ -913,14 +918,28 @@ export default function App() {
 
       console.log(`Found ${videoIds.length} unique video IDs. Fetching details (No-API)...`);
 
-      // Phase 2: Fetch all video details (No-API)
-      const allVideoDetails = await getBatchNoApiVideoDetails(videoIds);
-      
-      if (allVideoDetails.length === 0 && videoIds.length > 0) {
-        console.log("No-API fetch failed, falling back to YouTube Data API...");
-        // Fallback to YouTube API if No-API fails
-        const fallbackDetails = await getBatchVideoDetails(videoIds);
-        allVideoDetails.push(...fallbackDetails);
+      // Phase 2: Fetch all video details
+      const allVideoDetails = [];
+      for (let i = 0; i < videoIds.length; i++) {
+        setBatchProgress(i + 1);
+        const id = videoIds[i];
+        console.log(`Fetching details for video ${i + 1}/${videoIds.length}: ${id}`);
+        
+        // Try No-API first
+        let details = await getNoApiVideoDetails(id);
+        
+        // Fallback to API if No-API failed
+        if (!details) {
+          console.log(`No-API fetch failed for ${id}, falling back to YouTube Data API...`);
+          details = await getVideoDetails(id);
+        }
+        
+        if (details) {
+          allVideoDetails.push(details);
+        }
+        
+        // Small delay to be polite
+        await new Promise(resolve => setTimeout(resolve, 200));
       }
 
       if (allVideoDetails.length === 0 && videoIds.length > 0) {
@@ -1383,8 +1402,8 @@ export default function App() {
       let videoId = videoIdOrUrl.trim();
       
       // Extract video ID if a URL was provided
-      const videoMatch = videoId.match(/(?:v=|\/embed\/|\/watch\?v=|\/v\/|youtu\.be\/|\/shorts\/)([^#&?]*)/);
-      if (videoMatch && videoMatch[1] && videoMatch[1].length === 11) {
+      const videoMatch = videoId.match(/(?:v=|\/embed\/|\/watch\?v=|\/v\/|youtu\.be\/|\/shorts\/|^)([a-zA-Z0-9_-]{11})(?:[#&?].*)?$/);
+      if (videoMatch && videoMatch[1]) {
         videoId = videoMatch[1];
       }
 

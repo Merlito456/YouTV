@@ -124,6 +124,63 @@ async function startServer() {
     }
   });
 
+  // API Route: Fetch Playlist Video IDs without Data API v3
+  app.get("/api/youtube/playlist", async (req, res) => {
+    const { playlistId } = req.query;
+    if (!playlistId || typeof playlistId !== 'string') {
+      return res.status(400).json({ error: "playlistId is required" });
+    }
+
+    try {
+      console.log(`[Server] Fetching playlist: ${playlistId}`);
+      const url = `https://www.youtube.com/playlist?list=${playlistId}`;
+      const response = await fetch(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
+          'Accept-Language': 'en-US,en;q=0.9',
+        }
+      });
+
+      if (!response.ok) {
+        console.error(`[Server] YouTube returned status ${response.status} for playlist ${playlistId}`);
+        return res.status(response.status).json({ error: `YouTube returned ${response.status}` });
+      }
+
+      const html = await response.text();
+      const dataMatch = html.match(/ytInitialData\s*=\s*({.+?});/);
+      
+      if (!dataMatch) {
+        console.warn(`[Server] Could not find ytInitialData for playlist ${playlistId}`);
+        return res.status(404).json({ error: "Could not find playlist data" });
+      }
+
+      const initialData = JSON.parse(dataMatch[1]);
+      const videoIds: string[] = [];
+
+      // Extract video IDs from the complex ytInitialData structure
+      // Path 1: Standard playlist view
+      let contents = initialData.contents?.twoColumnBrowseResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents?.[0]?.playlistVideoListRenderer?.contents;
+      
+      // Path 2: Alternative structure
+      if (!contents) {
+        contents = initialData.contents?.singleColumnBrowseResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents?.[0]?.playlistVideoListRenderer?.contents;
+      }
+
+      if (contents && Array.isArray(contents)) {
+        contents.forEach((item: any) => {
+          const videoId = item.playlistVideoRenderer?.videoId;
+          if (videoId) videoIds.push(videoId);
+        });
+      }
+
+      console.log(`[Server] Found ${videoIds.length} videos in playlist ${playlistId}`);
+      res.json({ videoIds });
+    } catch (error) {
+      console.error(`[Server] Error fetching playlist ${playlistId}:`, error);
+      res.status(500).json({ error: "Internal server error fetching playlist" });
+    }
+  });
+
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({

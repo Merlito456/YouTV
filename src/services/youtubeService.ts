@@ -47,18 +47,6 @@ export async function getNoApiVideoDetails(videoId: string): Promise<any | null>
   }
 }
 
-export async function getBatchNoApiVideoDetails(videoIds: string[]): Promise<any[]> {
-  const results = [];
-  // We'll fetch them sequentially to avoid overwhelming our server or YouTube
-  for (const id of videoIds) {
-    const details = await getNoApiVideoDetails(id);
-    if (details) results.push(details);
-    // Small delay to be polite
-    await new Promise(resolve => setTimeout(resolve, 200));
-  }
-  return results;
-}
-
 export async function detectLiveVideoIds(sourceId: string): Promise<string[]> {
   const apiKey = getApiKey();
   try {
@@ -113,6 +101,22 @@ export async function detectLiveVideoIds(sourceId: string): Promise<string[]> {
     return [];
   } catch (error) {
     console.error("Error detecting live videos with YouTube API:", error);
+    return [];
+  }
+}
+
+export async function getNoApiPlaylistVideos(playlistId: string): Promise<string[]> {
+  try {
+    const response = await fetch(`/api/youtube/playlist?playlistId=${playlistId}`);
+    if (!response.ok) {
+      const errorData = await response.json();
+      console.error(`[No-API Playlist] Server returned error:`, errorData);
+      return [];
+    }
+    const data = await response.json();
+    return data.videoIds || [];
+  } catch (error) {
+    console.error(`[No-API Playlist] Error fetching playlist ${playlistId}:`, error);
     return [];
   }
 }
