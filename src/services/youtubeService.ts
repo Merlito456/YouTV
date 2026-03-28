@@ -63,61 +63,93 @@ export async function getNoApiVideoDetails(videoId: string): Promise<any | null>
   }
 }
 
-export async function detectLiveVideoIds(sourceId: string): Promise<string[]> {
+export async function detectLiveVideoIds(sourceId: string): Promise<{ videoIds: string[], resolvedChannelId?: string }> {
   const apiKey = getApiKey();
   try {
-    console.log(`Detecting live videos for source: ${sourceId} using key index ${currentKeyIndex}`);
+    console.log(`[YouTube Service] Detecting live videos for source: ${sourceId}`);
     let url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&eventType=live&maxResults=5&key=${apiKey}`;
+    let resolvedChannelId: string | undefined = undefined;
     
-    if (sourceId.startsWith('@')) {
-      // If it's a handle (@name), we first need to get the channel ID
-      const handleResponse = await fetch(
-        `https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&q=${encodeURIComponent(sourceId)}&key=${apiKey}`
-      );
-      const handleData = await handleResponse.json();
-      
-      if (handleData.error) {
-        console.error("YouTube API Error (Handle Search):", handleData.error);
-        return [];
-      }
-
-      if (handleData.items && handleData.items.length > 0) {
-        const channelId = handleData.items[0].id.channelId;
-        console.log(`Resolved handle ${sourceId} to channelId: ${channelId}`);
-        url += `&channelId=${channelId}`;
-      } else {
-        console.warn(`Could not resolve handle: ${sourceId}`);
-        return [];
-      }
-    } else if (sourceId.length === 24 && sourceId.startsWith('UC')) {
-      // It's a standard YouTube channel ID
-      url += `&channelId=${sourceId}`;
+    // 1. Try to identify if it's already a channel ID or needs resolution
+    const isStandardChannelId = sourceId.length === 24 && sourceId.startsWith('UC');
+    
+    if (isStandardChannelId) {
+      resolvedChannelId = sourceId;
+      url += `&channelId=${resolvedChannelId}`;
     } else {
-      // It's likely a search query or a legacy username
-      // We'll use it as a query parameter
-      url += `&q=${encodeURIComponent(sourceId)}`;
+      // Try to resolve handle or username to channel ID
+      console.log(`[YouTube Service] Attempting to resolve "${sourceId}" to a channel ID...`);
+      const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&q=${encodeURIComponent(sourceId)}&maxResults=1&key=${apiKey}`;
+      const searchResponse = await fetch(searchUrl);
+      const searchData = await searchResponse.json();
+      
+      if (searchData.items && searchData.items.length > 0) {
+        resolvedChannelId = searchData.items[0].id.channelId;
+        console.log(`[YouTube Service] Resolved "${sourceId}" to channelId: ${resolvedChannelId}`);
+        url += `&channelId=${resolvedChannelId}`;
+      } else {
+        console.warn(`[YouTube Service] Could not resolve "${sourceId}" to a channel ID. Using as query.`);
+        url += `&q=${encodeURIComponent(sourceId)}`;
+      }
     }
 
-    console.log(`Fetching live streams from: ${url.replace(apiKey, 'REDACTED_KEY')}`);
+    console.log(`[YouTube Service] Fetching live streams...`);
     const response = await fetch(url);
     const data = await response.json();
     
+    let videoIds: string[] = [];
+    
     if (data.error) {
-      console.error("YouTube API Error (Live Search):", data.error);
-      return [];
+      console.error("[YouTube Service] API Error (Live Search):", data.error);
+    } else if (data.items && data.items.length > 0) {
+      videoIds = data.items.map((item: any) => item.id.videoId);
+      console.log(`[YouTube Service] Found ${videoIds.length} live videos for ${sourceId} via search:`, videoIds);
     }
     
-    if (data.items && data.items.length > 0) {
-      const videoIds = data.items.map((item: any) => item.id.videoId);
-      console.log(`Found ${videoIds.length} live videos for ${sourceId}:`, videoIds);
-      return videoIds;
+    // FALLBACK: If no live videos found via search and we have a channelId, check activities
+    if (videoIds.length === 0 && resolvedChannelId) {
+      console.log(`[YouTube Service] Fallback: Checking activities for channel ${resolvedChannelId}...`);
+      const activitiesUrl = `https://www.googleapis.com/youtube/v3/activities?part=snippet,contentDetails&channelId=${resolvedChannelId}&maxResults=10&key=${apiKey}`;
+      const activitiesResponse = await fetch(activitiesUrl);
+      const activitiesData = await activitiesResponse.json();
+      
+      if (activitiesData.items) {
+        // Look for 'liveStream' or 'upload' that might be live
+        const potentialVideoIds = activitiesData.items
+          .filter((item: any) => item.snippet.type === 'liveStream' || item.snippet.type === 'upload')
+          .map((item: any) => item.contentDetails.liveStream?.videoId || item.contentDetails.upload?.videoId)
+          .filter(Boolean);
+          
+        if (potentialVideoIds.length > 0) {
+          console.log(`[YouTube Service] Checking ${potentialVideoIds.length} potential videos from activities for live status...`);
+          // We need to check if these are actually live
+          const detailsUrl = `https://www.googleapis.com/youtube/v3/videos?part=snippet,liveStreamingDetails&id=${potentialVideoIds.join(',')}&key=${apiKey}`;
+          const detailsResponse = await fetch(detailsUrl);
+          const detailsData = await detailsResponse.json();
+          
+          if (detailsData.items) {
+            const activeLiveIds = detailsData.items
+              .filter((item: any) => item.liveStreamingDetails && !item.liveStreamingDetails.actualEndTime)
+              .map((item: any) => item.id);
+              
+            if (activeLiveIds.length > 0) {
+              console.log(`[YouTube Service] Found ${activeLiveIds.length} live videos for ${sourceId} via activities:`, activeLiveIds);
+              videoIds = activeLiveIds;
+            }
+          }
+        }
+      }
     }
     
-    console.log(`No live videos found for ${sourceId}`);
-    return [];
+    if (videoIds.length > 0) {
+      return { videoIds, resolvedChannelId };
+    }
+    
+    console.log(`[YouTube Service] No live videos found for ${sourceId}`);
+    return { videoIds: [], resolvedChannelId };
   } catch (error) {
-    console.error("Error detecting live videos with YouTube API:", error);
-    return [];
+    console.error("[YouTube Service] Error detecting live videos:", error);
+    return { videoIds: [] };
   }
 }
 

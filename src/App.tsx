@@ -53,6 +53,7 @@ export default function App() {
   const [player, setPlayer] = useState<any>(null);
   const [error, setError] = useState<string | null>(null);
   const [showOverlay, setShowOverlay] = useState(true);
+  const [lastInteractionTime, setLastInteractionTime] = useState(Date.now());
   const [currentTime, setCurrentTime] = useState(new Date());
   const [isZapping, setIsZapping] = useState(false);
   const [showChannelList, setShowChannelList] = useState(false);
@@ -113,6 +114,7 @@ export default function App() {
   }, [showCornerAdTimed]);
 
   const overlayTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const channelListTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const volumeTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const channelNumberTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const channelListRef = useRef<HTMLDivElement>(null);
@@ -191,9 +193,366 @@ export default function App() {
     return () => subscription.unsubscribe();
   }, []);
 
+  const syncLiveStatus = useCallback(async (force = false) => {
+    if (isSyncing) return;
+    setIsSyncing(true);
+    setError(null);
+    
+    let syncCount = 0;
+    let liveCount = 0;
+    const MAX_SYNC_PER_CYCLE = 10; // Limit syncs per cycle to save quota
+    const SYNC_COOLDOWN = 2 * 60 * 1000; // 2 minutes cooldown per channel
+    
+    const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+    
+    try {
+      console.log(`Starting live sync (force=${force})...`);
+      // Get all channels to ensure we have the latest state
+      const { data: allChannels } = await supabase.from('channels').select('*');
+      if (!allChannels) {
+        console.log("No channels found in database.");
+        setIsSyncing(false);
+        return;
+      }
+
+      // Group channels by their source ID (channel_id, username, or query)
+      // This helps us identify which channels belong to the same "source"
+      const sourceGroups: { [key: string]: Channel[] } = {};
+      allChannels.forEach(c => {
+        const sourceId = c.channel_id || c.username || c.query;
+        if (sourceId) {
+          if (!sourceGroups[sourceId]) sourceGroups[sourceId] = [];
+          sourceGroups[sourceId].push(c);
+        }
+      });
+
+      // Sort source groups by last_live_check to prioritize stale channels
+      const sortedSourceIds = Object.keys(sourceGroups).sort((a, b) => {
+        const lastA = sourceGroups[a][0].last_live_check ? new Date(sourceGroups[a][0].last_live_check).getTime() : 0;
+        const lastB = sourceGroups[b][0].last_live_check ? new Date(sourceGroups[b][0].last_live_check).getTime() : 0;
+        return lastA - lastB;
+      });
+
+      for (const sourceId of sortedSourceIds) {
+        if (syncCount >= MAX_SYNC_PER_CYCLE && !force) {
+          console.log(`Reached max sync limit (${MAX_SYNC_PER_CYCLE}) for this cycle. Stopping.`);
+          break;
+        }
+
+        const relatedChannels = sourceGroups[sourceId].sort((a, b) => 
+          new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+        );
+        
+        const mainChannel = relatedChannels[0];
+        const relatedIds = relatedChannels.map(c => c.id);
+        
+        // --- QUOTA SAVING LOGIC ---
+        // 1. Check cooldown
+        const lastCheck = mainChannel.last_live_check ? new Date(mainChannel.last_live_check).getTime() : 0;
+        const timeSinceLastCheck = Date.now() - lastCheck;
+        if (!force && timeSinceLastCheck < SYNC_COOLDOWN) {
+          console.log(`Skipping ${mainChannel.name} (checked ${Math.round(timeSinceLastCheck / 1000)}s ago, cooldown is 10m)`);
+          continue;
+        }
+
+        // 2. Check if ANY of the related channels already have a live_video_id
+        const liveChannel = relatedChannels.find(c => c.is_live && c.live_video_id);
+        
+        if (!force && liveChannel && liveChannel.live_video_id) {
+          // CHEAP CHECK: Is it still live? (1 unit)
+          console.log(`Checking if existing live stream for ${mainChannel.name} is still active: ${liveChannel.live_video_id}`);
+          const stillLive = await isVideoLive(liveChannel.live_video_id);
+          
+          if (stillLive) {
+            console.log(`Live stream for ${mainChannel.name} is still active. Skipping search.`);
+            liveCount++;
+            // Update last_live_check for all related channels
+            await supabase.from('channels').update({ last_live_check: new Date().toISOString() }).in('id', relatedIds);
+            continue;
+          } else {
+            console.log(`Live stream for ${mainChannel.name} has ended. Will search for new streams.`);
+            // Mark it as not live so we can search again
+            await supabase.from('channels').update({ is_live: false, live_video_id: null }).eq('id', liveChannel.id);
+            liveChannel.is_live = false;
+            liveChannel.live_video_id = undefined;
+          }
+        }
+        
+        // 3. Check for fallback programs (not "LIVE BROADCAST") for the main channel
+        const { data: fallbackPrograms } = await supabase
+          .from('programs')
+          .select('id')
+          .eq('channel_id', mainChannel.id)
+          .neq('title', 'LIVE BROADCAST')
+          .limit(1);
+
+        const hasFallback = fallbackPrograms && fallbackPrograms.length > 0;
+
+        // Only trigger sync if both live videos and fallback programs are not available
+        // Exception: Priority channels like Kapamilya should always be scanned if they are currently live
+        const isPriority = mainChannel.name.toLowerCase().includes('kapamilya');
+        
+        if (!force && !isPriority && hasFallback) {
+          console.log(`Skipping sync for ${mainChannel.name} (has fallback programs)`);
+          // Update last_live_check for all related channels
+          await supabase.from('channels').update({ last_live_check: new Date().toISOString() }).in('id', relatedIds);
+          continue;
+        }
+        
+        // RATE LIMITING: Wait 1 second before each search (100 units)
+        if (syncCount > 0) await delay(1000);
+
+        console.log(`Searching for live streams for ${mainChannel.name} using sourceId: ${sourceId}...`);
+        const { videoIds, resolvedChannelId } = await detectLiveVideoIds(sourceId);
+        // Unique the IDs to prevent duplicates
+        const uniqueVideoIds = Array.from(new Set(videoIds));
+        
+        syncCount++;
+        
+        // Update last_live_check and potentially resolvedChannelId for all related channels
+        const updateData: any = { last_live_check: new Date().toISOString() };
+        if (resolvedChannelId && !mainChannel.channel_id) {
+          updateData.channel_id = resolvedChannelId;
+        }
+        await supabase.from('channels').update(updateData).in('id', relatedIds);
+
+        if (uniqueVideoIds.length > 0) {
+          console.log(`Found ${uniqueVideoIds.length} live stream(s) for ${mainChannel.name}`);
+          
+          for (let i = 0; i < uniqueVideoIds.length; i++) {
+            const liveVideoId = uniqueVideoIds[i];
+            const channelName = uniqueVideoIds.length > 1 ? `${mainChannel.name.replace(/\s\d+$/, '')} ${i + 1}` : mainChannel.name.replace(/\s\d+$/, '');
+            
+            let targetChannelId = null;
+            
+            if (i < relatedChannels.length) {
+              // Reuse existing channel
+              targetChannelId = relatedChannels[i].id;
+              await supabase.from('channels').update({
+                name: channelName,
+                is_live: true,
+                live_video_id: liveVideoId,
+                last_live_check: new Date().toISOString()
+              }).eq('id', targetChannelId);
+            } else {
+              // Create new channel for additional live stream
+              const { data: newChannel } = await supabase.from('channels').insert({
+                name: channelName,
+                channel_id: mainChannel.channel_id,
+                username: mainChannel.username,
+                query: mainChannel.query,
+                playlist_id: mainChannel.playlist_id,
+                is_live: true,
+                live_video_id: liveVideoId,
+                order_index: mainChannel.order_index,
+                last_live_check: new Date().toISOString()
+              }).select().single();
+              
+              if (newChannel) {
+                targetChannelId = newChannel.id;
+              }
+            }
+            
+            if (targetChannelId) {
+              // Ensure we have a "LIVE BROADCAST" program for this channel
+              const { data: existingLive } = await supabase
+                .from('programs')
+                .select('id')
+                .eq('channel_id', targetChannelId)
+                .eq('title', 'LIVE BROADCAST')
+                .limit(1);
+                
+              if (!existingLive || existingLive.length === 0) {
+                await addProgram(targetChannelId, 'LIVE BROADCAST', liveVideoId, 'Live stream');
+              } else {
+                // Update existing live program with new video ID
+                await supabase.from('programs').update({ video_id: liveVideoId }).eq('id', existingLive[0].id);
+              }
+            }
+          }
+          
+          // If we have fewer live streams than related channels, mark the rest as not live
+          if (uniqueVideoIds.length < relatedChannels.length) {
+            const remainingIds = relatedChannels.slice(uniqueVideoIds.length).map(c => c.id);
+            await supabase.from('channels').update({
+              is_live: false,
+              live_video_id: null,
+              last_live_check: new Date().toISOString()
+            }).in('id', remainingIds);
+          }
+          
+          liveCount++;
+        } else {
+          console.log(`No live streams found for ${mainChannel.name}`);
+          // Update last_live_check and mark as not live
+          await supabase.from('channels').update({
+            is_live: false,
+            live_video_id: null,
+            last_live_check: new Date().toISOString()
+          }).in('id', relatedIds);
+        }
+        
+        // Small delay between sources to avoid rate limits
+        await delay(500);
+      }
+      
+      console.log(`Live sync completed. Found ${liveCount} live sources.`);
+      if (liveCount > 0) {
+        // Refresh channels state
+        const { data: updatedChannels } = await supabase.from('channels').select('*').order('order_index', { ascending: true });
+        if (updatedChannels) setChannels(updatedChannels);
+      }
+    } catch (err) {
+      console.error("Error in syncLiveStatus:", err);
+      setError("Failed to sync live status. Check console for details.");
+    } finally {
+      setIsSyncing(false);
+    }
+  }, [isSyncing]);
+
+  const syncChannelPrograms = useCallback(async (channel: Channel) => {
+    // Only sync programs if not live and no live video ID exists
+    if (channel.is_live && channel.live_video_id) return;
+
+    try {
+      // Get current programs
+      const { data: current, error: fetchError } = await supabase
+        .from('programs')
+        .select('*')
+        .eq('channel_id', channel.id)
+        .order('created_at', { ascending: true });
+
+      if (fetchError) throw fetchError;
+
+      const count = current?.length || 0;
+      if (count >= 10) return;
+
+      const needed = 10 - count;
+
+      // Fetch videos from YouTube
+      let videos: any[] = [];
+      if (channel.playlist_id) {
+        videos = await fetchPlaylistVideos(channel.playlist_id);
+      } else if (channel.query) {
+        videos = await searchVideos(channel.query);
+      } else if (channel.channel_id) {
+        videos = await searchVideos('', 50, channel.channel_id);
+      }
+
+      if (videos.length === 0) return;
+
+      // Shuffle videos for randomness as requested
+      const shuffled = [...videos].sort(() => Math.random() - 0.5);
+
+      for (let i = 0; i < needed; i++) {
+        const video = shuffled[i % shuffled.length];
+        const videoId = video.id?.videoId || video.contentDetails?.videoId || (typeof video.id === 'string' ? video.id : null);
+        if (!videoId) continue;
+
+        await addProgram(
+          channel.id,
+          video.snippet.title,
+          videoId,
+          video.snippet.description
+        );
+      }
+    } catch (err) {
+      console.error("Error syncing channel programs:", err);
+    }
+  }, []);
+
+  const handleChannelChange = useCallback((channel: Channel) => {
+    setLastInteractionTime(Date.now());
+    if (channel.id === currentChannel?.id) return;
+    
+    // Check for parental restrictions
+    if (restrictedChannels.includes(channel.id)) {
+      const pin = prompt('This channel is restricted. Enter Parental PIN:');
+      if (pin !== parentalPin) {
+        setError('Incorrect PIN. Access denied.');
+        return;
+      }
+    }
+    
+    setIsZapping(true);
+    setShowChannelNumber(true);
+    setCurrentChannel(channel);
+    setShowOverlay(true);
+    setShowChannelList(false);
+    
+    // Refresh EPG for the new channel immediately
+    if (!channel.is_live && !channel.live_video_id) {
+      syncChannelPrograms(channel).then(() => {
+        // If still no programs after sync, try live sync
+        supabase.from('programs').select('id').eq('channel_id', channel.id).limit(1).then(({ data }) => {
+          if (!data || data.length === 0) {
+            syncLiveStatus();
+          }
+        });
+      });
+    }
+
+    // Clear zapping effect after 1.5s
+    setTimeout(() => setIsZapping(false), 1500);
+    
+    // Auto-hide channel number after 3s
+    if (channelNumberTimeoutRef.current) clearTimeout(channelNumberTimeoutRef.current);
+    channelNumberTimeoutRef.current = setTimeout(() => setShowChannelNumber(false), 3000);
+  }, [currentChannel, restrictedChannels, parentalPin, syncChannelPrograms, syncLiveStatus]);
+
+  const adjustVolume = useCallback((delta: number) => {
+    if (!player) return;
+    const newVolume = Math.min(100, Math.max(0, volume + delta));
+    setVolume(newVolume);
+    player.setVolume(newVolume);
+    if (newVolume > 0 && isMuted) {
+      player.unMute();
+      setIsMuted(false);
+    }
+    setShowVolumeOverlay(true);
+    if (volumeTimeoutRef.current) clearTimeout(volumeTimeoutRef.current);
+    volumeTimeoutRef.current = setTimeout(() => setShowVolumeOverlay(false), 2000);
+  }, [player, volume, isMuted]);
+
+  const toggleMute = useCallback(() => {
+    if (!player) return;
+    if (isMuted) {
+      player.unMute();
+      setIsMuted(false);
+    } else {
+      player.mute();
+      setIsMuted(true);
+    }
+    setShowVolumeOverlay(true);
+    if (volumeTimeoutRef.current) clearTimeout(volumeTimeoutRef.current);
+    volumeTimeoutRef.current = setTimeout(() => setShowVolumeOverlay(false), 2000);
+  }, [player, isMuted]);
+
+  const switchChannel = useCallback((direction: 'next' | 'prev') => {
+    if (channels.length === 0) {
+      console.warn("Cannot switch channel: channels array is empty");
+      return;
+    }
+    const currentIndex = currentChannel ? channels.findIndex(c => c.id === currentChannel.id) : 0;
+    
+    // If current channel not found, default to 0
+    const baseIndex = currentIndex === -1 ? 0 : currentIndex;
+    
+    let nextIndex = direction === 'next' ? baseIndex + 1 : baseIndex - 1;
+    
+    if (nextIndex >= channels.length) nextIndex = 0;
+    if (nextIndex < 0) nextIndex = channels.length - 1;
+    
+    console.log(`[Navigation] Switching channel ${direction}: from index ${currentIndex} to ${nextIndex} (Channel: ${channels[nextIndex].name})`);
+    handleChannelChange(channels[nextIndex]);
+  }, [channels, currentChannel, handleChannelChange]);
+
   // --- Keyboard & Remote Navigation ---
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      setLastInteractionTime(Date.now());
+      console.log(`[Input] Key pressed: ${e.key}`);
+
       if (!hasInteracted) {
         setHasInteracted(true);
         if (player && player.playVideo) {
@@ -311,11 +670,13 @@ export default function App() {
       switch (e.key) {
         case 'ArrowUp':
         case 'ChannelUp':
+        case 'PageUp':
           e.preventDefault();
           switchChannel('prev');
           break;
         case 'ArrowDown':
         case 'ChannelDown':
+        case 'PageDown':
           e.preventDefault();
           switchChannel('next');
           break;
@@ -380,46 +741,7 @@ export default function App() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [channels, currentChannel, showAdminPanel, showEPG, showChannelList, showPasswordModal, player, isMuted, volume, hasInteracted, focusedChannelIndex]);
-
-  const switchChannel = (direction: 'next' | 'prev') => {
-    if (channels.length === 0) return;
-    const currentIndex = currentChannel ? channels.indexOf(currentChannel) : 0;
-    let nextIndex = direction === 'next' ? currentIndex + 1 : currentIndex - 1;
-    
-    if (nextIndex >= channels.length) nextIndex = 0;
-    if (nextIndex < 0) nextIndex = channels.length - 1;
-    
-    handleChannelChange(channels[nextIndex]);
-  };
-
-  const adjustVolume = (delta: number) => {
-    if (!player) return;
-    const newVolume = Math.min(100, Math.max(0, volume + delta));
-    setVolume(newVolume);
-    player.setVolume(newVolume);
-    if (newVolume > 0 && isMuted) {
-      player.unMute();
-      setIsMuted(false);
-    }
-    setShowVolumeOverlay(true);
-    if (volumeTimeoutRef.current) clearTimeout(volumeTimeoutRef.current);
-    volumeTimeoutRef.current = setTimeout(() => setShowVolumeOverlay(false), 2000);
-  };
-
-  const toggleMute = () => {
-    if (!player) return;
-    if (isMuted) {
-      player.unMute();
-      setIsMuted(false);
-    } else {
-      player.mute();
-      setIsMuted(true);
-    }
-    setShowVolumeOverlay(true);
-    if (volumeTimeoutRef.current) clearTimeout(volumeTimeoutRef.current);
-    volumeTimeoutRef.current = setTimeout(() => setShowVolumeOverlay(false), 2000);
-  };
+  }, [channels, currentChannel, showAdminPanel, showEPG, showChannelList, showPasswordModal, player, isMuted, volume, hasInteracted, focusedChannelIndex, switchChannel, adjustVolume, toggleMute]);
 
   // --- YouTube API Loading ---
   useEffect(() => {
@@ -781,9 +1103,29 @@ export default function App() {
 
   // --- Overlay Timeout ---
   useEffect(() => {
-    // Permanent overlay as requested by user
-    setShowOverlay(true);
-  }, []);
+    if (showOverlay && hasInteracted) {
+      if (overlayTimeoutRef.current) clearTimeout(overlayTimeoutRef.current);
+      overlayTimeoutRef.current = setTimeout(() => {
+        setShowOverlay(false);
+      }, 3000);
+    }
+    return () => {
+      if (overlayTimeoutRef.current) clearTimeout(overlayTimeoutRef.current);
+    };
+  }, [showOverlay, hasInteracted, lastInteractionTime]);
+
+  // --- Channel List Timeout ---
+  useEffect(() => {
+    if (showChannelList && hasInteracted) {
+      if (channelListTimeoutRef.current) clearTimeout(channelListTimeoutRef.current);
+      channelListTimeoutRef.current = setTimeout(() => {
+        setShowChannelList(false);
+      }, 8000); // Increased to 8 seconds
+    }
+    return () => {
+      if (channelListTimeoutRef.current) clearTimeout(channelListTimeoutRef.current);
+    };
+  }, [showChannelList, hasInteracted, lastInteractionTime]);
 
   useEffect(() => {
     if (player && hasInteracted && !isMuted) {
@@ -819,47 +1161,6 @@ export default function App() {
     setTimeout(() => setError(null), 3000);
   };
 
-  const handleChannelChange = (channel: Channel) => {
-    if (channel.id === currentChannel?.id) return;
-    
-    // Check for parental restrictions
-    if (restrictedChannels.includes(channel.id)) {
-      const pin = prompt('This channel is restricted. Enter Parental PIN:');
-      if (pin !== parentalPin) {
-        setError('Incorrect PIN. Access denied.');
-        return;
-      }
-    }
-    
-    setIsZapping(true);
-    setShowChannelNumber(true);
-    setCurrentChannel(channel);
-    setShowOverlay(true);
-    setShowChannelList(false);
-    
-    // Refresh EPG for the new channel immediately
-    if (!channel.is_live && !channel.live_video_id) {
-      syncChannelPrograms(channel).then(() => {
-        // If still no programs after sync, try live sync
-        supabase.from('programs').select('id').eq('channel_id', channel.id).limit(1).then(({ data }) => {
-          if (!data || data.length === 0) {
-            syncLiveStatus();
-          }
-        });
-      });
-    }
-    
-    setTimeout(() => {
-      setIsZapping(false);
-    }, 800);
-
-    if (channelNumberTimeoutRef.current) clearTimeout(channelNumberTimeoutRef.current);
-    channelNumberTimeoutRef.current = setTimeout(() => {
-      setShowChannelNumber(false);
-    }, 3000);
-
-    if (!channel.is_live) syncChannelPrograms(channel);
-  };
 
   const [isBatchAdding, setIsBatchAdding] = useState(false);
   const [batchProgress, setBatchProgress] = useState(0);
@@ -1083,57 +1384,6 @@ export default function App() {
     return scheduled.find(p => isWithinInterval(now, { start: p.start, end: p.end }));
   }, [programs, getScheduledProgramsForChannel]);
 
-  const syncChannelPrograms = async (channel: Channel) => {
-    // Only sync programs if not live and no live video ID exists
-    if (channel.is_live && channel.live_video_id) return;
-
-    try {
-      // Get current programs
-      const { data: current, error: fetchError } = await supabase
-        .from('programs')
-        .select('*')
-        .eq('channel_id', channel.id)
-        .order('created_at', { ascending: true });
-
-      if (fetchError) throw fetchError;
-
-      const count = current?.length || 0;
-      if (count >= 10) return;
-
-      const needed = 10 - count;
-
-      // Fetch videos from YouTube
-      let videos: any[] = [];
-      if (channel.playlist_id) {
-        videos = await fetchPlaylistVideos(channel.playlist_id);
-      } else if (channel.query) {
-        videos = await searchVideos(channel.query);
-      } else if (channel.channel_id) {
-        videos = await searchVideos('', 50, channel.channel_id);
-      }
-
-      if (videos.length === 0) return;
-
-      // Shuffle videos for randomness as requested
-      const shuffled = [...videos].sort(() => Math.random() - 0.5);
-
-      for (let i = 0; i < needed; i++) {
-        const video = shuffled[i % shuffled.length];
-        const videoId = video.id?.videoId || video.contentDetails?.videoId || (typeof video.id === 'string' ? video.id : null);
-        if (!videoId) continue;
-
-        await addProgram(
-          channel.id,
-          video.snippet.title,
-          videoId,
-          video.snippet.description
-        );
-      }
-    } catch (err) {
-      console.error("Error syncing channel programs:", err);
-    }
-  };
-
   const handleReportContent = () => {
     if (!currentChannel) return;
     setComplianceType('report');
@@ -1146,213 +1396,6 @@ export default function App() {
     // For now, we'll show a confirmation and provide instructions
     setComplianceType('deletion');
     setShowComplianceModal(true);
-  };
-
-  const syncLiveStatus = async (force = false) => {
-    if (isSyncing) return;
-    setIsSyncing(true);
-    setError(null);
-    
-    let syncCount = 0;
-    let liveCount = 0;
-    const MAX_SYNC_PER_CYCLE = 10; // Limit syncs per cycle to save quota
-    const SYNC_COOLDOWN = 10 * 60 * 1000; // 10 minutes cooldown per channel
-    
-    const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-    
-    try {
-      console.log(`Starting live sync (force=${force})...`);
-      // Get all channels to ensure we have the latest state
-      const { data: allChannels } = await supabase.from('channels').select('*');
-      if (!allChannels) {
-        console.log("No channels found in database.");
-        setIsSyncing(false);
-        return;
-      }
-
-      // Group channels by their source ID (channel_id, username, or query)
-      // This helps us identify which channels belong to the same "source"
-      const sourceGroups: { [key: string]: Channel[] } = {};
-      allChannels.forEach(c => {
-        const sourceId = c.channel_id || c.username || c.query;
-        if (sourceId) {
-          if (!sourceGroups[sourceId]) sourceGroups[sourceId] = [];
-          sourceGroups[sourceId].push(c);
-        }
-      });
-
-      // Sort source groups by last_live_check to prioritize stale channels
-      const sortedSourceIds = Object.keys(sourceGroups).sort((a, b) => {
-        const lastA = sourceGroups[a][0].last_live_check ? new Date(sourceGroups[a][0].last_live_check).getTime() : 0;
-        const lastB = sourceGroups[b][0].last_live_check ? new Date(sourceGroups[b][0].last_live_check).getTime() : 0;
-        return lastA - lastB;
-      });
-
-      for (const sourceId of sortedSourceIds) {
-        if (syncCount >= MAX_SYNC_PER_CYCLE && !force) {
-          console.log(`Reached max sync limit (${MAX_SYNC_PER_CYCLE}) for this cycle. Stopping.`);
-          break;
-        }
-
-        const relatedChannels = sourceGroups[sourceId].sort((a, b) => 
-          new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-        );
-        
-        const mainChannel = relatedChannels[0]; // The oldest one is our "Primary"
-        
-        // --- QUOTA SAVING LOGIC ---
-        // 1. Check cooldown
-        const lastCheck = mainChannel.last_live_check ? new Date(mainChannel.last_live_check).getTime() : 0;
-        const timeSinceLastCheck = Date.now() - lastCheck;
-        if (!force && timeSinceLastCheck < SYNC_COOLDOWN) {
-          console.log(`Skipping ${mainChannel.name} (checked ${Math.round(timeSinceLastCheck / 1000)}s ago, cooldown is 10m)`);
-          continue;
-        }
-
-        // 2. Check if ANY of the related channels already have a live_video_id
-        const liveChannel = relatedChannels.find(c => c.is_live && c.live_video_id);
-        
-        if (!force && liveChannel && liveChannel.live_video_id) {
-          // CHEAP CHECK: Is it still live?
-          console.log(`Checking if existing live stream for ${mainChannel.name} is still active: ${liveChannel.live_video_id}`);
-          const stillLive = await isVideoLive(liveChannel.live_video_id);
-          
-          if (stillLive) {
-            console.log(`Live stream for ${mainChannel.name} is still active. Skipping search.`);
-            liveCount++;
-            // Update last_live_check even if we skip search
-            await supabase.from('channels').update({ last_live_check: new Date().toISOString() }).eq('id', mainChannel.id);
-            continue;
-          } else {
-            console.log(`Live stream for ${mainChannel.name} has ended. Will search for new streams.`);
-            // Mark it as not live so we can search again
-            await supabase.from('channels').update({ is_live: false, live_video_id: null }).eq('id', liveChannel.id);
-            liveChannel.is_live = false;
-            liveChannel.live_video_id = undefined;
-          }
-        }
-        
-        // 3. Check for fallback programs (not "LIVE BROADCAST") for the main channel
-        const { data: fallbackPrograms } = await supabase
-          .from('programs')
-          .select('id')
-          .eq('channel_id', mainChannel.id)
-          .neq('title', 'LIVE BROADCAST')
-          .limit(1);
-
-        const hasFallback = fallbackPrograms && fallbackPrograms.length > 0;
-
-        // Only trigger sync if both live videos and fallback programs are not available
-        // Exception: Priority channels like Kapamilya should always be scanned if they are currently live
-        const isPriority = mainChannel.name.toLowerCase().includes('kapamilya');
-        
-        if (!force && !isPriority && hasFallback) {
-          console.log(`Skipping sync for ${mainChannel.name} (has fallback programs)`);
-          // Update last_live_check even if we skip search
-          await supabase.from('channels').update({ last_live_check: new Date().toISOString() }).eq('id', mainChannel.id);
-          continue;
-        }
-        
-        // RATE LIMITING: Wait 1 second before each search
-        if (syncCount > 0) await delay(1000);
-
-        console.log(`Searching for live streams for ${mainChannel.name} using sourceId: ${sourceId}...`);
-        let liveVideoIds = await detectLiveVideoIds(sourceId);
-        // Unique the IDs to prevent duplicates
-        liveVideoIds = Array.from(new Set(liveVideoIds));
-        
-        syncCount++;
-        
-        // Update last_live_check for the main channel
-        await supabase.from('channels').update({ last_live_check: new Date().toISOString() }).eq('id', mainChannel.id);
-
-        if (liveVideoIds.length > 0) {
-          console.log(`Found ${liveVideoIds.length} live stream(s) for ${mainChannel.name}`);
-          
-          for (let i = 0; i < liveVideoIds.length; i++) {
-            const liveVideoId = liveVideoIds[i];
-            const channelName = liveVideoIds.length > 1 ? `${mainChannel.name.replace(/\s\d+$/, '')} ${i + 1}` : mainChannel.name.replace(/\s\d+$/, '');
-            
-            let targetChannelId = null;
-            
-            if (i < relatedChannels.length) {
-              // Reuse existing channel
-              targetChannelId = relatedChannels[i].id;
-            } else {
-              // Create new sub-channel
-              const { data: newSub, error: subError } = await supabase
-                .from('channels')
-                .insert([{
-                  name: channelName,
-                  query: mainChannel.query,
-                  username: mainChannel.username,
-                  channel_id: mainChannel.channel_id,
-                  is_live: true,
-                  live_video_id: liveVideoId
-                }])
-                .select()
-                .single();
-                
-              if (subError) throw subError;
-              targetChannelId = newSub.id;
-              // Add to relatedChannels so we don't try to create it again
-              relatedChannels.push(newSub);
-            }
-            
-            liveCount++;
-            
-            // Update channel to be live and store video ID
-            await supabase
-              .from('channels')
-              .update({ 
-                name: channelName,
-                is_live: true,
-                live_video_id: liveVideoId
-              })
-              .eq('id', targetChannelId);
-          }
-
-          // Delete any extra sub-channels that are no longer needed
-          if (relatedChannels.length > liveVideoIds.length) {
-            const toDelete = relatedChannels.slice(liveVideoIds.length);
-            for (const extra of toDelete) {
-              // First delete its programs to avoid foreign key issues
-              await supabase.from('programs').delete().eq('channel_id', extra.id);
-              // Then delete the channel
-              await supabase.from('channels').delete().eq('id', extra.id);
-            }
-          }
-        } else {
-          console.log(`No live stream found for ${mainChannel.name}`);
-          // Mark primary as not live
-          await supabase
-            .from('channels')
-            .update({ 
-              is_live: false,
-              live_video_id: null
-            })
-            .eq('id', mainChannel.id);
-            
-          // Delete all sub-channels
-          if (relatedChannels.length > 1) {
-            const subChannels = relatedChannels.slice(1);
-            for (const sub of subChannels) {
-              await supabase.from('programs').delete().eq('channel_id', sub.id);
-              await supabase.from('channels').delete().eq('id', sub.id);
-            }
-          }
-        }
-      }
-      
-      if (syncCount > 0) {
-        console.log(`Sync complete. Scanned ${syncCount} channels, found ${liveCount} live streams.`);
-      }
-    } catch (err: any) {
-      console.error("Sync error:", err);
-      setError("Sync failed: " + err.message);
-    } finally {
-      setIsSyncing(false);
-    }
   };
 
   const toggleChannelLive = async (id: string, currentStatus: boolean) => {
@@ -1465,10 +1508,17 @@ export default function App() {
         showOverlay ? "cursor-default" : "cursor-none"
       )}
       onMouseMove={() => {
+        setLastInteractionTime(Date.now());
+        setShowOverlay(true);
+        if (!hasInteracted) setHasInteracted(true);
+      }}
+      onTouchStart={() => {
+        setLastInteractionTime(Date.now());
         setShowOverlay(true);
         if (!hasInteracted) setHasInteracted(true);
       }}
       onClick={() => {
+        setLastInteractionTime(Date.now());
         setShowOverlay(true);
         if (!hasInteracted) setHasInteracted(true);
         if (isMuted && player) {
@@ -1477,6 +1527,62 @@ export default function App() {
         }
       }}
     >
+      {/* Minimal Display (Area 2 & 3) - Shows when overlay is hidden */}
+      <AnimatePresence>
+        {!showOverlay && hasInteracted && currentChannel && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="absolute inset-0 z-40 pointer-events-none p-4 md:p-10"
+          >
+            {/* Area 3: Top Right - Channel Name, Video Title & Date/Time */}
+            <div className="absolute top-4 md:top-10 right-4 md:right-10 flex flex-col items-end gap-1 drop-shadow-lg">
+              <div className="text-sm md:text-base font-black uppercase tracking-tighter text-red-600 italic">
+                {currentChannel.name}
+              </div>
+              <div className="text-xs md:text-sm font-bold text-white/60 line-clamp-1 max-w-md text-right">
+                {currentProgram?.title}
+              </div>
+              {/* Relocated Date & Time */}
+              <div className="flex flex-col items-end gap-0.5 mt-1">
+                <div className="text-sm md:text-xl font-black text-white tracking-tighter">
+                  {format(currentTime, 'HH:mm:ss')}
+                </div>
+                <div className="text-[8px] md:text-[10px] font-black text-white/40 uppercase tracking-widest">
+                  {format(currentTime, 'EEEE, MMM d, yyyy')}
+                </div>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Channel List Trigger Area (Right Side) */}
+      <div 
+        className="absolute right-0 top-0 bottom-0 w-10 md:w-20 z-[55] cursor-pointer"
+        onMouseEnter={() => setShowChannelList(true)}
+      />
+
+      {/* Mobile Swipe Area (Right to Left) */}
+      <div 
+        className="absolute inset-y-0 right-0 w-12 z-[55] md:hidden"
+        onTouchStart={(e) => {
+          const touch = e.touches[0];
+          const startX = touch.clientX;
+          const handleTouchMove = (moveEvent: TouchEvent) => {
+            const moveX = moveEvent.touches[0].clientX;
+            if (startX - moveX > 50) {
+              setShowChannelList(true);
+              document.removeEventListener('touchmove', handleTouchMove);
+            }
+          };
+          document.addEventListener('touchmove', handleTouchMove, { passive: true });
+          document.addEventListener('touchend', () => {
+            document.removeEventListener('touchmove', handleTouchMove);
+          }, { once: true });
+        }}
+      />
       {/* Age Gate Overlay */}
       <AnimatePresence>
         {showAgeGate && (
@@ -1484,31 +1590,31 @@ export default function App() {
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[1000] bg-black flex items-center justify-center p-6"
+            className="fixed inset-0 z-[1000] bg-black flex items-center justify-center p-4 md:p-6"
           >
             <div className="absolute inset-0 bg-[url('https://media.giphy.com/media/oEI9uWUAbjg3e/giphy.gif')] opacity-10 mix-blend-screen scale-150" />
             <motion.div 
               initial={{ scale: 0.9, y: 20 }}
               animate={{ scale: 1, y: 0 }}
-              className="relative z-10 w-full max-w-md bg-white/5 border border-white/10 rounded-[2.5rem] p-10 text-center space-y-8 backdrop-blur-2xl"
+              className="relative z-10 w-full max-w-md bg-white/5 border border-white/10 rounded-[2rem] md:rounded-[2.5rem] p-6 md:p-10 text-center space-y-6 md:space-y-8 backdrop-blur-2xl"
             >
-              <div className="w-20 h-20 bg-red-600 rounded-2xl flex items-center justify-center mx-auto shadow-2xl shadow-red-600/40">
-                <Tv className="w-10 h-10 text-white" />
+              <div className="w-16 h-16 md:w-20 md:h-20 bg-red-600 rounded-2xl flex items-center justify-center mx-auto shadow-2xl shadow-red-600/40">
+                <Tv className="w-8 h-8 md:w-10 md:h-10 text-white" />
               </div>
-              <div className="space-y-2">
-                <h1 className="text-4xl font-black uppercase tracking-tighter italic">YouTV</h1>
-                <p className="text-white/60 text-sm font-medium">This application may contain content suitable for mature audiences. Please confirm your age to continue.</p>
+              <div className="space-y-1 md:space-y-2">
+                <h1 className="text-3xl md:text-4xl font-black uppercase tracking-tighter italic leading-none">YouTV</h1>
+                <p className="text-white/60 text-xs md:text-sm font-medium">This application may contain content suitable for mature audiences. Please confirm your age to continue.</p>
               </div>
-              <div className="grid grid-cols-2 gap-4">
+              <div className="grid grid-cols-2 gap-3 md:gap-4">
                 <button 
                   onClick={() => handleAgeVerification(true)}
-                  className="py-4 bg-white text-black font-black rounded-2xl transition-all uppercase tracking-widest text-xs hover:scale-105 active:scale-95"
+                  className="py-3 md:py-4 bg-white text-black font-black rounded-xl md:rounded-2xl transition-all uppercase tracking-widest text-[10px] md:text-xs hover:scale-105 active:scale-95"
                 >
                   I am 13+
                 </button>
                 <button 
                   onClick={() => handleAgeVerification(false)}
-                  className="py-4 bg-white/10 hover:bg-white/20 text-white font-black rounded-2xl transition-all uppercase tracking-widest text-xs active:scale-95"
+                  className="py-3 md:py-4 bg-white/10 hover:bg-white/20 text-white font-black rounded-xl md:rounded-2xl transition-all uppercase tracking-widest text-[10px] md:text-xs active:scale-95"
                 >
                   Under 13
                 </button>
@@ -1525,20 +1631,20 @@ export default function App() {
             initial={{ y: -50 }}
             animate={{ y: 0 }}
             exit={{ y: -50 }}
-            className="fixed top-0 left-0 right-0 z-[100] bg-red-600 text-white py-2 px-4 flex items-center justify-center gap-4 text-[10px] font-black uppercase tracking-widest"
+            className="fixed top-0 left-0 right-0 z-[100] bg-red-600 text-white py-1.5 md:py-2 px-2 md:px-4 flex items-center justify-center gap-2 md:gap-4 text-[8px] md:text-[10px] font-black uppercase tracking-widest"
           >
-            <div className="flex items-center gap-2">
-              <Zap className="w-3 h-3" />
-              <span>YouTV is a viewer for YouTube content. All videos are hosted on YouTube's servers.</span>
+            <div className="flex items-center gap-1.5 md:gap-2">
+              <Zap className="w-2.5 h-2.5 md:w-3 md:h-3" />
+              <span className="line-clamp-1">YouTV is a viewer for YouTube content. All videos are hosted on YouTube's servers.</span>
             </div>
             <button 
               onClick={() => { setComplianceType('terms'); setShowComplianceModal(true); }}
-              className="underline hover:text-white/80 transition-colors"
+              className="underline hover:text-white/80 transition-colors whitespace-nowrap"
             >
               Learn More
             </button>
-            <button onClick={() => setShowDisclaimer(false)} className="p-1 hover:bg-white/10 rounded-full">
-              <X className="w-3 h-3" />
+            <button onClick={() => setShowDisclaimer(false)} className="p-1 hover:bg-white/10 rounded-full shrink-0">
+              <X className="w-2.5 h-2.5 md:w-3 md:h-3" />
             </button>
           </motion.div>
         )}
@@ -1549,17 +1655,17 @@ export default function App() {
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="absolute inset-0 z-[100] bg-black flex flex-col items-center justify-center gap-12 overflow-hidden"
+            className="absolute inset-0 z-[100] bg-black flex flex-col items-center justify-center gap-8 md:gap-12 overflow-hidden px-6"
           >
             <div className="absolute inset-0 bg-[url('https://media.giphy.com/media/oEI9uWUAbjg3e/giphy.gif')] opacity-10 mix-blend-screen scale-150" />
             
-            <div className="relative z-10 flex flex-col items-center gap-6 text-center">
-              <div className="w-32 h-32 bg-red-600 rounded-full flex items-center justify-center shadow-[0_0_100px_rgba(220,38,38,0.4)] animate-pulse">
-                <MonitorPlay className="w-16 h-16 text-white" />
+            <div className="relative z-10 flex flex-col items-center gap-4 md:gap-6 text-center">
+              <div className="w-24 h-24 md:w-32 md:h-32 bg-red-600 rounded-full flex items-center justify-center shadow-[0_0_100px_rgba(220,38,38,0.4)] animate-pulse">
+                <MonitorPlay className="w-12 h-12 md:w-16 md:h-16 text-white" />
               </div>
-              <div className="space-y-2">
-                <h1 className="text-6xl font-black uppercase tracking-tighter leading-none">Retro TV</h1>
-                <p className="text-white/40 text-sm font-black uppercase tracking-[0.5em]">Broadcast Network</p>
+              <div className="space-y-1 md:space-y-2">
+                <h1 className="text-4xl md:text-6xl font-black uppercase tracking-tighter leading-none">Retro TV</h1>
+                <p className="text-white/40 text-[10px] md:text-sm font-black uppercase tracking-[0.4em] md:tracking-[0.5em]">Broadcast Network</p>
               </div>
             </div>
 
@@ -1573,7 +1679,7 @@ export default function App() {
                   setIsMuted(false);
                 }
               }}
-              className="relative z-10 px-12 py-5 bg-white text-black rounded-full font-black text-sm uppercase tracking-[0.3em] hover:scale-110 transition-transform active:scale-95 shadow-2xl shadow-white/20"
+              className="relative z-10 px-8 md:px-12 py-4 md:py-5 bg-white text-black rounded-full font-black text-xs md:text-sm uppercase tracking-[0.2em] md:tracking-[0.3em] hover:scale-110 transition-transform active:scale-95 shadow-2xl shadow-white/20"
             >
               Start Watching
             </button>
@@ -1601,10 +1707,10 @@ export default function App() {
       <div className="absolute inset-0 z-0 flex gap-0 items-start p-0 overflow-hidden bg-black">
         <div 
           ref={containerRef}
-          className="h-full relative overflow-hidden transition-all duration-700"
+          className="h-full relative overflow-hidden transition-all duration-700 flex items-center justify-center"
           style={{ width: showAd ? 'calc(100% - 340px)' : '100%' }}
         >
-          <div id="youtube-player" className={cn("w-full h-full scale-110 transition-all duration-700", !showOverlay && "pointer-events-none")} />
+          <div id="youtube-player" className={cn("w-full h-full max-w-full max-h-full aspect-video scale-100 transition-all duration-700", !showOverlay && "pointer-events-none")} />
         </div>
 
         {/* Ad Sidebar */}
@@ -1695,19 +1801,19 @@ export default function App() {
             initial={{ opacity: 0, scale: 0.8 }}
             animate={{ opacity: 1, scale: 1 }}
             exit={{ opacity: 0, scale: 1.2 }}
-            className="absolute top-10 left-10 z-[55] flex flex-col items-start gap-2 drop-shadow-[0_0_30px_rgba(0,0,0,0.8)]"
+            className="absolute top-4 md:top-10 left-4 md:left-10 z-[55] flex flex-col items-start gap-1 md:gap-2 drop-shadow-[0_0_30px_rgba(0,0,0,0.8)]"
           >
-            <div className="flex items-center gap-6">
-              <div className="text-[12vw] font-black italic text-red-600 leading-none select-none drop-shadow-[0_0_50px_rgba(220,38,38,0.5)]">
+            <div className="flex items-center gap-4 md:gap-6">
+              <div className="text-[15vw] md:text-[12vw] font-black italic text-red-600 leading-none select-none drop-shadow-[0_0_50px_rgba(220,38,38,0.5)]">
                 {currentChannel ? channels.indexOf(currentChannel) + 1 : ''}
               </div>
-              <div className="space-y-1">
-                <div className="text-4xl font-black uppercase tracking-tighter text-white">
+              <div className="space-y-0.5 md:space-y-1">
+                <div className="text-xl md:text-4xl font-black uppercase tracking-tighter text-white line-clamp-1">
                   {currentChannel?.name}
                 </div>
-                <div className="flex items-center gap-2">
-                  <span className="px-2 py-0.5 bg-red-600 text-[8px] font-black rounded uppercase tracking-widest animate-pulse">Live</span>
-                  <span className="text-white/40 font-bold text-xs uppercase tracking-widest">
+                <div className="flex items-center gap-1.5 md:gap-2">
+                  <span className="px-1.5 md:px-2 py-0.5 bg-red-600 text-[6px] md:text-[8px] font-black rounded uppercase tracking-widest animate-pulse">Live</span>
+                  <span className="text-white/40 font-bold text-[10px] md:text-xs uppercase tracking-widest">
                     {currentProgram ? format(currentProgram.start, 'HH:mm') : '--:--'}
                   </span>
                 </div>
@@ -1776,76 +1882,74 @@ export default function App() {
             initial={{ y: -100 }}
             animate={{ y: 0 }}
             exit={{ y: -100 }}
-            className="absolute top-0 left-0 right-0 h-20 bg-gradient-to-b from-black/80 to-transparent flex items-center justify-between px-10 z-50"
+            className="absolute top-0 left-0 right-0 h-16 md:h-20 bg-gradient-to-b from-black/80 to-transparent flex items-center justify-between px-4 md:px-10 z-50"
           >
-            <div className="flex items-center gap-4">
-              <div className="w-12 h-12 bg-red-600 rounded-xl flex items-center justify-center shadow-2xl shadow-red-600/40">
-                <Tv className="w-7 h-7 text-white" />
+            <div className="flex items-center gap-2 md:gap-4">
+              <div className="w-8 h-8 md:w-12 md:h-12 bg-red-600 rounded-lg md:rounded-xl flex items-center justify-center shadow-2xl shadow-red-600/40">
+                <Tv className="w-5 h-5 md:w-7 md:h-7 text-white" />
               </div>
               <div className="flex flex-col">
-                <h1 className="text-3xl font-black tracking-tighter italic leading-none">YouTV</h1>
-                <div className="flex items-center gap-2 mt-1">
-                  <img src="https://www.youtube.com/img/desktop/yt_1200.png" alt="YouTube" className="h-3 opacity-50" />
-                  <span className="text-[8px] text-white/40 font-bold uppercase tracking-widest">Content from YouTube</span>
+                <h1 className="text-xl md:text-3xl font-black tracking-tighter italic leading-none">YouTV</h1>
+                <div className="flex items-center gap-1 md:gap-2 mt-0.5 md:mt-1">
+                  <img src="https://www.youtube.com/img/desktop/yt_1200.png" alt="YouTube" className="h-2 md:h-3 opacity-50" />
+                  <span className="text-[6px] md:text-[8px] text-white/40 font-bold uppercase tracking-widest">Content from YouTube</span>
                 </div>
               </div>
             </div>
 
-            <div className="flex flex-col items-end gap-1">
-              <div className="flex items-center gap-6">
+            <div className="flex flex-col items-end gap-0.5 md:gap-1">
+              <div className="flex items-center gap-3 md:gap-6">
                 {isMuted && (
-                  <div className="flex items-center gap-2 text-red-500 font-black uppercase tracking-widest text-[10px] animate-pulse">
-                    <VolumeX className="w-4 h-4" />
+                  <div className="hidden sm:flex items-center gap-2 text-red-500 font-black uppercase tracking-widest text-[8px] md:text-[10px] animate-pulse">
+                    <VolumeX className="w-3 h-3 md:w-4 md:h-4" />
                     Muted
                   </div>
                 )}
                 <button 
                   onClick={() => setShowEPG(true)}
-                  className="flex items-center gap-2 text-white/60 hover:text-white transition-colors font-bold uppercase tracking-widest text-xs"
+                  className="flex items-center gap-1 md:gap-2 text-white/60 hover:text-white transition-colors font-bold uppercase tracking-widest text-[10px] md:text-xs"
                 >
-                  <Calendar className="w-4 h-4" />
-                  Guide
+                  <Calendar className="w-3 h-3 md:w-4 md:h-4" />
+                  <span className="hidden xs:inline">Guide</span>
                 </button>
                 <button 
                   onClick={() => setShowChannelList(true)}
-                  className="flex items-center gap-2 text-white/60 hover:text-white transition-colors font-bold uppercase tracking-widest text-xs"
+                  className="flex items-center gap-1 md:gap-2 text-white/60 hover:text-white transition-colors font-bold uppercase tracking-widest text-[10px] md:text-xs"
                 >
-                  <MonitorPlay className="w-4 h-4" />
-                  Channels
+                  <MonitorPlay className="w-3 h-3 md:w-4 md:h-4" />
+                  <span className="hidden xs:inline">Channels</span>
                 </button>
 
                 <button 
                   onClick={() => setShowParentalControls(true)}
-                  className="flex items-center gap-2 text-white/60 hover:text-white transition-colors font-bold uppercase tracking-widest text-xs"
+                  className="flex items-center gap-1 md:gap-2 text-white/60 hover:text-white transition-colors font-bold uppercase tracking-widest text-[10px] md:text-xs"
                 >
-                  <LogIn className="w-4 h-4" />
-                  Parental
+                  <LogIn className="w-3 h-3 md:w-4 md:h-4" />
+                  <span className="hidden xs:inline">Parental</span>
                 </button>
                 
-                {/* Admin button removed for Play Store compliance - access via hidden gesture */}
-                
                 {session?.user ? (
-                  <div className="flex items-center gap-4">
-                    <div className="flex items-center gap-3 bg-white/10 pl-1 pr-4 py-1 rounded-full border border-white/10">
-                      <img src={session.user.user_metadata.avatar_url || ''} alt="" className="w-8 h-8 rounded-full" />
-                      <span className="text-sm font-bold">{session.user.user_metadata.full_name}</span>
+                  <div className="flex items-center gap-2 md:gap-4">
+                    <div className="flex items-center gap-2 md:gap-3 bg-white/10 pl-0.5 pr-2 md:pr-4 py-0.5 md:py-1 rounded-full border border-white/10">
+                      <img src={session.user.user_metadata.avatar_url || ''} alt="" className="w-5 h-5 md:w-8 md:h-8 rounded-full" />
+                      <span className="hidden sm:inline text-xs md:text-sm font-bold">{session.user.user_metadata.full_name}</span>
                       <button onClick={handleLogout} className="text-white/40 hover:text-red-500">
-                        <LogOut className="w-4 h-4" />
+                        <LogOut className="w-3 h-3 md:w-4 md:h-4" />
                       </button>
                     </div>
                   </div>
                 ) : (
-                  <button onClick={handleLogin} className="bg-white text-black px-6 py-2 rounded-full font-black text-xs uppercase tracking-widest hover:scale-105 transition-transform">
+                  <button onClick={handleLogin} className="bg-white text-black px-3 md:px-6 py-1 md:py-2 rounded-full font-black text-[10px] md:text-xs uppercase tracking-widest hover:scale-105 transition-transform">
                     Login
                   </button>
                 )}
               </div>
 
-              <div className="flex items-center gap-4 text-[8px] font-black uppercase tracking-widest text-white/20">
-                <button onClick={() => { setComplianceType('terms'); setShowComplianceModal(true); }} className="hover:text-white transition-colors">Terms of Service</button>
-                <button onClick={() => { setComplianceType('privacy'); setShowComplianceModal(true); }} className="hover:text-white transition-colors">Privacy Policy</button>
-                <a href="https://www.youtube.com/t/terms" target="_blank" className="hover:text-white transition-colors">YouTube Terms</a>
-                <a href="https://policies.google.com/privacy" target="_blank" className="hover:text-white transition-colors">Google Privacy</a>
+              <div className="flex items-center gap-2 md:gap-4 text-[6px] md:text-[8px] font-black uppercase tracking-widest text-white/20">
+                <button onClick={() => { setComplianceType('terms'); setShowComplianceModal(true); }} className="hover:text-white transition-colors">Terms</button>
+                <button onClick={() => { setComplianceType('privacy'); setShowComplianceModal(true); }} className="hover:text-white transition-colors">Privacy</button>
+                <a href="https://www.youtube.com/t/terms" target="_blank" className="hidden xs:inline hover:text-white transition-colors">YouTube Terms</a>
+                <a href="https://policies.google.com/privacy" target="_blank" className="hidden xs:inline hover:text-white transition-colors">Google Privacy</a>
               </div>
             </div>
           </motion.header>
@@ -1860,55 +1964,39 @@ export default function App() {
             initial={{ y: 200 }}
             animate={{ y: 0 }}
             exit={{ y: 200 }}
-            className="absolute bottom-0 left-0 right-0 p-10 bg-gradient-to-t from-black/90 via-black/60 to-transparent z-50"
+            className="absolute bottom-0 left-0 right-0 p-4 md:p-10 bg-gradient-to-t from-black/90 via-black/60 to-transparent z-50"
           >
-            <div className="flex items-end justify-between gap-10">
-              <div className="space-y-2">
-                <div className="flex items-center gap-4">
-                  <div className="text-6xl font-black italic text-red-600 drop-shadow-[0_0_20px_rgba(220,38,38,0.5)]">
+            <div className="flex flex-col md:flex-row md:items-end justify-between gap-4 md:gap-10">
+              <div className="space-y-1 md:space-y-2">
+                <div className="flex items-center gap-3 md:gap-4">
+                  <div className="text-4xl md:text-6xl font-black italic text-red-600 drop-shadow-[0_0_20px_rgba(220,38,38,0.5)]">
                     {channels.indexOf(currentChannel) + 1}
                   </div>
                   <div>
-                    <h2 className="text-4xl font-black uppercase tracking-tighter">{currentChannel.name}</h2>
-                    <div className="flex items-center gap-3">
+                    <h2 className="text-xl md:text-4xl font-black uppercase tracking-tighter leading-tight">{currentChannel.name}</h2>
+                    <div className="flex flex-wrap items-center gap-2 md:gap-3">
                       <span className={cn(
-                        "px-2 py-0.5 text-[10px] font-black rounded uppercase tracking-widest animate-pulse flex items-center gap-1",
+                        "px-1.5 md:px-2 py-0.5 text-[8px] md:text-[10px] font-black rounded uppercase tracking-widest animate-pulse flex items-center gap-1",
                         currentChannel.is_live ? "bg-red-600" : "bg-white/20"
                       )}>
                         <div className="w-1 h-1 bg-white rounded-full" />
                         {currentChannel.is_live ? 'LIVE' : 'REC'}
                       </span>
 
-                      <div className="flex items-center gap-4 ml-2">
+                      <div className="flex items-center gap-2 md:gap-4 ml-0 md:ml-2">
                         {currentProgram?.video_id && (
                           <a 
                             href={`https://www.youtube.com/watch?v=${currentProgram.video_id}`}
                             target="_blank"
                             rel="noopener noreferrer"
-                            className="text-[10px] text-white/40 hover:text-red-600 font-black uppercase tracking-widest transition-colors"
+                            className="text-[8px] md:text-[10px] text-white/40 hover:text-red-600 font-black uppercase tracking-widest transition-colors"
                           >
-                            Watch on YouTube
+                            YouTube
                           </a>
                         )}
                         <button 
-                          onClick={async () => {
-                            const reason = prompt('Why are you reporting this content?', 'Inappropriate content');
-                            if (reason && reason.trim()) {
-                              try {
-                                await supabase.from('reports').insert([{
-                                  video_id: currentProgram?.video_id,
-                                  channel_name: currentChannel?.name,
-                                  reason: reason,
-                                  reported_at: new Date().toISOString(),
-                                  user_agent: navigator.userAgent
-                                }]);
-                                alert('Thank you for reporting. We will review within 72 hours.');
-                              } catch (error) {
-                                alert('Thank you for your report. Our team will review this content within 72 hours.');
-                              }
-                            }
-                          }}
-                          className="text-[10px] text-white/40 hover:text-red-600 font-black uppercase tracking-widest transition-colors"
+                          onClick={handleReportContent}
+                          className="text-[8px] md:text-[10px] text-white/40 hover:text-red-600 font-black uppercase tracking-widest transition-colors"
                         >
                           Report
                         </button>
@@ -1926,14 +2014,7 @@ export default function App() {
                         className="p-1 rounded-full hover:bg-white/10 transition-all"
                         title="Reload Video"
                       >
-                        <RefreshCw className="w-3 h-3 text-white/40" />
-                      </button>
-                      <button 
-                        onClick={handleReportContent}
-                        className="p-1 rounded-full hover:bg-white/10 transition-all"
-                        title="Report Content"
-                      >
-                        <Info className="w-3 h-3 text-white/40" />
+                        <RefreshCw className="w-2.5 h-2.5 md:w-3 md:h-3 text-white/40" />
                       </button>
                       <button 
                         onClick={() => syncLiveStatus()}
@@ -1943,105 +2024,91 @@ export default function App() {
                         )}
                         title="Sync Live Status"
                       >
-                        <Activity className={cn("w-3 h-3 text-white/40", isSyncing && "animate-spin")} />
+                        <Activity className={cn("w-2.5 h-2.5 md:w-3 md:h-3 text-white/40", isSyncing && "animate-spin")} />
                       </button>
-                      <span className="text-white/40 font-bold text-sm uppercase tracking-widest">
+                      <span className="text-white/40 font-bold text-xs md:text-sm uppercase tracking-widest">
                         {currentProgram ? format(currentProgram.start, 'HH:mm') : '--:--'}
                       </span>
                     </div>
                   </div>
                 </div>
                 {currentProgram && (
-                  <div className="pl-20">
-                    <h3 className="text-xl font-bold text-white/80">{currentProgram.title}</h3>
-                    <p className="text-white/40 text-sm max-w-2xl line-clamp-2">{currentProgram.description}</p>
-                    {nextProgram && (
-                      <div className="mt-2 flex items-center gap-2 text-[10px] font-black uppercase tracking-widest text-white/20">
-                        <span className="text-white/40">Next:</span>
-                        <span>{format(nextProgram.start, 'HH:mm')} - {nextProgram.title}</span>
-                      </div>
-                    )}
+                  <div className="pl-12 md:pl-20">
+                    <h3 className="text-xs md:text-sm font-bold text-white/80 line-clamp-1">{currentProgram.title}</h3>
+                    {/* Video details removed as requested */}
                   </div>
                 )}
               </div>
 
-              <div className="flex flex-col items-end gap-4">
-                <div className="flex items-center gap-4 bg-white/5 backdrop-blur-md border border-white/10 p-4 rounded-2xl">
-                  <div className="flex flex-col items-end gap-1">
-                    <div className="text-[8px] font-black text-white/20 uppercase tracking-widest">Signal</div>
-                    <div className="flex gap-0.5 items-end h-3">
-                      <div className="w-1 h-1 bg-red-600 rounded-full" />
-                      <div className="w-1 h-2 bg-red-600 rounded-full" />
-                      <div className="w-1 h-3 bg-red-600 rounded-full" />
-                      <div className="w-1 h-2 bg-white/20 rounded-full" />
-                    </div>
-                  </div>
-                  <div className="text-right border-l border-white/10 pl-4">
-                    <div className="text-[10px] font-black text-white/40 uppercase tracking-widest">Next Program</div>
-                    <div className="font-bold text-sm">
-                      {scheduledPrograms.find(p => p.start > currentTime)?.title || 'End of Broadcast'}
-                    </div>
-                  </div>
-                  <ChevronRight className="w-5 h-5 text-white/20" />
-                </div>
-                <div className="flex flex-col items-end gap-1">
-                  <div className="text-2xl font-black text-white tracking-tighter">
-                    {format(currentTime, 'HH:mm:ss')}
-                  </div>
-                  <div className="text-[10px] font-black text-white/40 uppercase tracking-widest">
-                    {format(currentTime, 'EEEE, MMM d, yyyy')}
-                  </div>
+              <div className="flex flex-col items-center md:items-end gap-4">
+                {/* Channel Navigation Buttons */}
+                <div className="flex items-center gap-2">
+                  <button 
+                    onClick={(e) => { e.stopPropagation(); switchChannel('prev'); }}
+                    className="px-3 md:px-4 py-1.5 md:py-2 bg-white/10 hover:bg-white/20 rounded-lg md:rounded-xl text-[10px] md:text-xs font-black uppercase tracking-widest transition-all"
+                  >
+                    Prev
+                  </button>
+                  <button 
+                    onClick={(e) => { e.stopPropagation(); switchChannel('next'); }}
+                    className="px-3 md:px-4 py-1.5 md:py-2 bg-white/10 hover:bg-white/20 rounded-lg md:rounded-xl text-[10px] md:text-xs font-black uppercase tracking-widest transition-all"
+                  >
+                    Next
+                  </button>
                 </div>
               </div>
             </div>
+
           </motion.div>
           </>
         )}
       </AnimatePresence>
 
-      {/* Channel List Sidebar */}
+      {/* Channel List Sidebar (Left Side) */}
       <AnimatePresence>
         {showChannelList && (
           <motion.div 
-            initial={{ x: '100%' }}
+            initial={{ x: '-100%' }}
             animate={{ x: 0 }}
-            exit={{ x: '100%' }}
-            className="absolute top-0 right-0 bottom-0 w-96 bg-black/80 backdrop-blur-2xl border-l border-white/10 z-50 p-10 flex flex-col"
+            exit={{ x: '-100%' }}
+            className="absolute top-0 left-0 bottom-0 w-full sm:w-64 md:w-72 bg-black/90 backdrop-blur-2xl border-r border-white/10 z-[60] p-3 md:p-4 flex flex-col"
+            onMouseMove={() => setLastInteractionTime(Date.now())}
           >
-            <div className="flex items-center justify-between mb-10">
-              <h3 className="text-2xl font-black italic uppercase tracking-tighter">Channels</h3>
-              <button onClick={() => setShowChannelList(false)} className="p-2 hover:bg-white/10 rounded-full">
-                <X className="w-6 h-6" />
+            <div className="flex items-center justify-between mb-3 md:mb-4">
+              <h3 className="text-base md:text-lg font-black italic uppercase tracking-tighter">Channels</h3>
+              <button onClick={() => setShowChannelList(false)} className="p-1.5 hover:bg-white/10 rounded-full">
+                <X className="w-3.5 h-3.5 md:w-4 md:h-4" />
               </button>
             </div>
 
             <div 
               ref={channelListRef}
-              className="flex-1 overflow-y-auto space-y-4 pr-4 -mr-4 custom-scrollbar"
+              onScroll={() => setLastInteractionTime(Date.now())}
+              className="flex-1 overflow-y-auto space-y-1.5 md:space-y-2 pr-1 -mr-1 scrollbar-thin scrollbar-thumb-red-600/50 hover:scrollbar-thumb-red-600 scrollbar-track-transparent"
             >
               {channels.map((channel, idx) => (
                 <button
                   key={channel.id}
                   onClick={() => handleChannelChange(channel)}
                   className={cn(
-                    "w-full text-left p-6 rounded-2xl border transition-all group relative overflow-hidden outline-none",
+                    "w-full text-left p-1.5 md:p-2 rounded-lg border transition-all group relative overflow-hidden outline-none",
                     currentChannel?.id === channel.id
-                      ? "bg-red-600 border-red-600 shadow-2xl shadow-red-600/20"
+                      ? "bg-red-600 border-red-600 shadow-lg shadow-red-600/20"
                       : "bg-white/5 border-white/5 hover:bg-white/10",
-                    focusedChannelIndex === idx && "ring-4 ring-white/40 border-white/20 bg-white/10"
+                    focusedChannelIndex === idx && "ring-2 ring-white/40 border-white/20 bg-white/10"
                   )}
                 >
-                  <div className="relative z-10 flex items-center gap-6">
+                  <div className="relative z-10 flex items-center gap-2 md:gap-3">
                     <div className={cn(
-                      "text-4xl font-black italic",
+                      "text-lg md:text-xl font-black italic",
                       currentChannel?.id === channel.id ? "text-white" : "text-white/20"
                     )}>
                       {idx + 1}
                     </div>
-                    <div>
-                      <div className="font-black uppercase tracking-tighter text-lg">{channel.name}</div>
+                    <div className="min-w-0 flex-1">
+                      <div className="font-black uppercase tracking-tighter text-[10px] md:text-xs truncate">{channel.name}</div>
                       <div className={cn(
-                        "text-[10px] font-bold uppercase tracking-widest",
+                        "text-[6px] md:text-[7px] font-bold uppercase tracking-widest truncate",
                         currentChannel?.id === channel.id ? "text-white/60" : "text-white/20"
                       )}>
                         {getActiveProgramForChannel(channel.id)?.title || 'Off Air'}
@@ -2068,21 +2135,21 @@ export default function App() {
             initial={{ opacity: 0, scale: 1.1 }}
             animate={{ opacity: 1, scale: 1 }}
             exit={{ opacity: 0, scale: 1.1 }}
-            className="absolute inset-0 z-[60] bg-black/95 backdrop-blur-3xl p-20 flex flex-col"
+            className="absolute inset-0 z-[70] bg-black/95 backdrop-blur-3xl p-6 md:p-20 flex flex-col overflow-hidden"
           >
-            <div className="flex items-center justify-between mb-20">
-              <div className="space-y-2">
-                <h2 className="text-6xl font-black italic uppercase tracking-tighter">TV Guide</h2>
-                <p className="text-white/40 font-bold uppercase tracking-[0.3em] text-sm">Schedule for {format(new Date(), 'EEEE, MMMM do')}</p>
+            <div className="flex items-center justify-between mb-8 md:mb-20">
+              <div className="space-y-1 md:space-y-2">
+                <h2 className="text-3xl md:text-6xl font-black italic uppercase tracking-tighter">TV Guide</h2>
+                <p className="text-white/40 font-bold uppercase tracking-[0.2em] md:tracking-[0.3em] text-[10px] md:text-sm">Schedule for {format(new Date(), 'EEEE, MMM do')}</p>
               </div>
-              <button onClick={() => setShowEPG(false)} className="w-20 h-20 rounded-full bg-white/5 flex items-center justify-center hover:bg-white/10 transition-all hover:scale-110">
-                <X className="w-10 h-10" />
+              <button onClick={() => setShowEPG(false)} className="w-12 h-12 md:w-20 md:h-20 rounded-full bg-white/5 flex items-center justify-center hover:bg-white/10 transition-all hover:scale-110">
+                <X className="w-6 h-6 md:w-10 md:h-10" />
               </button>
             </div>
 
             <div 
               ref={epgRef}
-              className="flex-1 overflow-y-auto space-y-12 pr-10 -mr-10 custom-scrollbar"
+              className="flex-1 overflow-y-auto space-y-8 md:space-y-12 pr-4 -mr-4 custom-scrollbar"
             >
               {channels.map((channel, idx) => {
                 const channelPrograms = programs.filter(p => p.channel_id === channel.id);
@@ -2090,16 +2157,16 @@ export default function App() {
                 const isFocused = focusedChannelIndex === idx;
                 return (
                   <div key={channel.id} className={cn(
-                    "space-y-6 p-6 rounded-3xl transition-all",
-                    isFocused && "bg-white/5 ring-2 ring-white/20"
+                    "space-y-4 md:space-y-6 p-4 md:p-6 rounded-2xl md:rounded-3xl transition-all",
+                    isFocused && "bg-white/5 ring-1 md:ring-2 ring-white/20"
                   )}>
-                    <div className="flex items-center gap-4">
-                      <div className="w-12 h-12 bg-white/10 rounded-xl flex items-center justify-center font-black italic text-xl">
+                    <div className="flex items-center gap-3 md:gap-4">
+                      <div className="w-8 h-8 md:w-12 md:h-12 bg-white/10 rounded-lg md:rounded-xl flex items-center justify-center font-black italic text-sm md:text-xl">
                         {channels.indexOf(channel) + 1}
                       </div>
-                      <h4 className="text-2xl font-black uppercase tracking-tighter">{channel.name}</h4>
+                      <h4 className="text-lg md:text-2xl font-black uppercase tracking-tighter">{channel.name}</h4>
                     </div>
-                    <div className="flex gap-4 overflow-x-auto pb-4 -mb-4 no-scrollbar">
+                    <div className="flex gap-3 md:gap-4 overflow-x-auto pb-4 -mb-4 no-scrollbar">
                       {scheduled.length > 0 ? (
                         scheduled.map(p => {
                           const now = new Date();
@@ -2108,28 +2175,28 @@ export default function App() {
                             <div 
                               key={p.id}
                               className={cn(
-                                "min-w-[300px] p-6 rounded-2xl border transition-all",
+                                "min-w-[200px] md:min-w-[300px] p-4 md:p-6 rounded-xl md:rounded-2xl border transition-all",
                                 isActive ? "bg-red-600 border-red-600" : "bg-white/5 border-white/5"
                               )}
                             >
-                              <div className="text-xs font-black uppercase tracking-widest mb-2 opacity-60">
+                              <div className="text-[8px] md:text-xs font-black uppercase tracking-widest mb-1 md:mb-2 opacity-60">
                                 {format(p.start, 'HH:mm')} - {format(p.end, 'HH:mm')}
                               </div>
-                              <div className="font-black text-lg uppercase tracking-tighter mb-2">{p.title}</div>
-                              <p className="text-xs opacity-40 line-clamp-2">{p.description}</p>
+                              <div className="font-black text-sm md:text-lg uppercase tracking-tighter mb-1 md:mb-2 line-clamp-1">{p.title}</div>
+                              <p className="text-[10px] md:text-xs opacity-40 line-clamp-2">{p.description}</p>
                             </div>
                           );
                         })
                       ) : (
-                        <div className="flex flex-col items-center gap-4 p-10 bg-white/5 rounded-3xl border border-dashed border-white/10">
-                          <div className="text-white/20 font-bold italic">No programs scheduled</div>
+                        <div className="flex flex-col items-center gap-3 md:gap-4 p-6 md:p-10 bg-white/5 rounded-2xl md:rounded-3xl border border-dashed border-white/10 w-full">
+                          <div className="text-white/20 font-bold italic text-xs md:text-sm">No programs scheduled</div>
                           <button 
                             onClick={() => syncLiveStatus(true)}
                             disabled={isSyncing}
-                            className="px-6 py-2 bg-red-600 hover:bg-red-700 rounded-full text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-2"
+                            className="px-4 md:px-6 py-1.5 md:py-2 bg-red-600 hover:bg-red-700 rounded-full text-[8px] md:text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-2"
                           >
-                            <RefreshCw className={cn("w-3 h-3", isSyncing && "animate-spin")} />
-                            {isSyncing ? 'Syncing...' : 'Check for Live Stream'}
+                            <RefreshCw className={cn("w-2.5 h-2.5 md:w-3 md:h-3", isSyncing && "animate-spin")} />
+                            {isSyncing ? 'Syncing...' : 'Sync Live'}
                           </button>
                         </div>
                       )}
@@ -2398,29 +2465,31 @@ export default function App() {
 
               {/* Manage Section */}
               <section className={cn(
-                "space-y-10 p-10 rounded-[3rem] transition-all",
+                "space-y-6 sm:space-y-10 p-6 sm:p-10 rounded-2xl sm:rounded-[3rem] transition-all",
                 (focusedAdminIndex === 1 || focusedAdminIndex === 3) && "bg-white/5 ring-4 ring-red-600/20 border border-red-600/20"
               )}>
-                <div className="flex items-center justify-between border-l-8 border-red-600 pl-6">
-                  <h3 className="text-2xl font-black uppercase tracking-tighter">Manage Content</h3>
-                  <button 
-                    onClick={() => syncLiveStatus()}
-                    disabled={isSyncing}
-                    className={cn(
-                      "flex items-center gap-3 px-8 py-4 rounded-2xl font-black text-xs uppercase tracking-widest transition-all active:scale-95",
-                      isSyncing ? "bg-white/10 text-white/40 cursor-not-allowed" : "bg-white text-black hover:bg-white/90"
-                    )}
-                  >
-                    <RefreshCw className={cn("w-4 h-4", isSyncing && "animate-spin")} />
-                    {isSyncing ? 'Syncing...' : 'Sync All Live Channels'}
-                  </button>
-                  <button 
-                    onClick={() => window.location.reload()}
-                    className="flex items-center gap-3 px-8 py-4 rounded-2xl font-black text-xs uppercase tracking-widest bg-white/10 text-white hover:bg-white/20 transition-all active:scale-95"
-                  >
-                    <RefreshCw className="w-4 h-4" />
-                    Refresh App
-                  </button>
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-6 border-l-4 sm:border-l-8 border-red-600 pl-4 sm:pl-6">
+                  <h3 className="text-xl sm:text-2xl font-black uppercase tracking-tighter">Manage Content</h3>
+                  <div className="flex items-center gap-2">
+                    <button 
+                      onClick={() => syncLiveStatus(true)}
+                      disabled={isSyncing}
+                      className={cn(
+                        "flex-1 sm:flex-none flex items-center justify-center gap-3 px-4 sm:px-8 py-3 sm:py-4 rounded-2xl font-black text-[10px] sm:text-xs uppercase tracking-widest transition-all active:scale-95",
+                        isSyncing ? "bg-white/10 text-white/40 cursor-not-allowed" : "bg-white text-black hover:bg-white/90"
+                      )}
+                    >
+                      <RefreshCw className={cn("w-3 h-3 sm:w-4 sm:h-4", isSyncing && "animate-spin")} />
+                      {isSyncing ? 'Syncing...' : 'Sync All'}
+                    </button>
+                    <button 
+                      onClick={() => window.location.reload()}
+                      className="flex-1 sm:flex-none flex items-center justify-center gap-3 px-4 sm:px-8 py-3 sm:py-4 rounded-2xl font-black text-[10px] sm:text-xs uppercase tracking-widest bg-white/10 text-white hover:bg-white/20 transition-all active:scale-95"
+                    >
+                      <RefreshCw className="w-3 h-3 sm:w-4 sm:h-4" />
+                      Refresh
+                    </button>
+                  </div>
                 </div>
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-20">
                   <div className="space-y-6">
@@ -2430,7 +2499,7 @@ export default function App() {
                         <div key={c.id} className="flex items-center justify-between p-6 bg-white/5 rounded-2xl border border-white/5">
                           <div className="flex flex-col gap-1">
                             <div className="flex items-center gap-4">
-                              <span className="text-xl font-black uppercase tracking-tighter">{c.name}</span>
+                              <span className="text-lg sm:text-xl font-black uppercase tracking-tighter">{c.name}</span>
                               {c.is_live && <Zap className="w-4 h-4 text-red-500 animate-pulse" />}
                             </div>
                             {c.live_video_id && (
@@ -2463,7 +2532,7 @@ export default function App() {
                       {programs.slice(0, 10).map(p => (
                         <div key={p.id} className="flex items-center justify-between p-6 bg-white/5 rounded-2xl border border-white/5">
                           <div className="min-w-0">
-                            <div className="text-xl font-black uppercase tracking-tighter truncate">{p.title}</div>
+                            <div className="text-lg sm:text-xl font-black uppercase tracking-tighter truncate">{p.title}</div>
                             <div className="text-[10px] font-black text-white/40 uppercase tracking-widest">Duration: {Math.floor(p.duration / 60)}m {p.duration % 60}s</div>
                           </div>
                           <button onClick={() => deleteProgram(p.id)} className="text-red-500 hover:text-red-400 p-2 shrink-0">
@@ -2513,27 +2582,27 @@ export default function App() {
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[200] flex items-center justify-center bg-black/95 backdrop-blur-2xl p-6"
+            className="fixed inset-0 z-[200] flex items-center justify-center bg-black/95 backdrop-blur-2xl p-4 md:p-6"
           >
             <motion.div 
               initial={{ scale: 0.9, y: 20 }}
               animate={{ scale: 1, y: 0 }}
               exit={{ scale: 0.9, y: 20 }}
-              className="w-full max-w-2xl bg-white/5 border border-white/10 rounded-[2.5rem] p-10 space-y-8 max-h-[80vh] overflow-y-auto custom-scrollbar"
+              className="w-full max-w-2xl bg-white/5 border border-white/10 rounded-[1.5rem] md:rounded-[2.5rem] p-6 md:p-10 space-y-6 md:space-y-8 max-h-[85vh] overflow-y-auto custom-scrollbar"
             >
               <div className="flex items-center justify-between">
-                <h2 className="text-3xl font-black italic uppercase tracking-tighter">
+                <h2 className="text-xl md:text-3xl font-black italic uppercase tracking-tighter">
                   {complianceType === 'privacy' && 'Privacy Policy'}
                   {complianceType === 'terms' && 'Terms of Service'}
                   {complianceType === 'deletion' && 'Account Deletion'}
                   {complianceType === 'report' && 'Report Content'}
                 </h2>
                 <button onClick={() => setShowComplianceModal(false)} className="p-2 hover:bg-white/10 rounded-full transition-colors">
-                  <X className="w-6 h-6" />
+                  <X className="w-5 h-5 md:w-6 md:h-6" />
                 </button>
               </div>
 
-              <div className="space-y-6 text-white/60 text-sm leading-relaxed font-medium">
+              <div className="space-y-4 md:space-y-6 text-white/60 text-[10px] md:text-sm leading-relaxed font-medium">
                 {complianceType === 'privacy' && (
                   <div className="space-y-6">
                     <p><strong>Last Updated:</strong> March 27, 2026</p>
@@ -2670,52 +2739,52 @@ export default function App() {
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[200] flex items-center justify-center bg-black/95 backdrop-blur-2xl p-6"
+            className="fixed inset-0 z-[200] flex items-center justify-center bg-black/95 backdrop-blur-2xl p-4 md:p-6"
           >
             <motion.div 
               initial={{ scale: 0.9, y: 20 }}
               animate={{ scale: 1, y: 0 }}
               exit={{ scale: 0.9, y: 20 }}
-              className="w-full max-w-2xl bg-white/5 border border-white/10 rounded-[2.5rem] p-10 space-y-8 max-h-[80vh] overflow-y-auto custom-scrollbar"
+              className="w-full max-w-2xl bg-white/5 border border-white/10 rounded-[1.5rem] md:rounded-[2.5rem] p-6 md:p-10 space-y-6 md:space-y-8 max-h-[85vh] overflow-y-auto custom-scrollbar"
             >
               <div className="flex items-center justify-between">
-                <h2 className="text-3xl font-black italic uppercase tracking-tighter">Parental Controls</h2>
+                <h2 className="text-xl md:text-3xl font-black italic uppercase tracking-tighter">Parental Controls</h2>
                 <button onClick={() => setShowParentalControls(false)} className="p-2 hover:bg-white/10 rounded-full transition-colors">
-                  <X className="w-6 h-6" />
+                  <X className="w-5 h-5 md:w-6 md:h-6" />
                 </button>
               </div>
 
-              <div className="space-y-8">
-                <section className="space-y-4">
-                  <h3 className="text-white font-bold uppercase tracking-widest text-xs">Restrict Channels</h3>
-                  <p className="text-white/40 text-xs">Restricted channels will require the Parental PIN to view.</p>
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="space-y-6 md:space-y-8">
+                <section className="space-y-3 md:space-y-4">
+                  <h3 className="text-white font-bold uppercase tracking-widest text-[8px] md:text-xs">Restrict Channels</h3>
+                  <p className="text-white/40 text-[10px] md:text-xs">Restricted channels will require the Parental PIN to view.</p>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 md:gap-4">
                     {channels.map(channel => (
                       <button
                         key={channel.id}
                         onClick={() => toggleChannelRestriction(channel.id)}
                         className={cn(
-                          "flex items-center justify-between p-4 rounded-2xl border transition-all",
+                          "flex items-center justify-between p-3 md:p-4 rounded-xl md:rounded-2xl border transition-all",
                           restrictedChannels.includes(channel.id)
                             ? "bg-red-600/20 border-red-600 text-white"
                             : "bg-white/5 border-white/10 text-white/40 hover:bg-white/10"
                         )}
                       >
-                        <span className="font-bold text-sm uppercase tracking-tight">{channel.name}</span>
-                        {restrictedChannels.includes(channel.id) && <LogIn className="w-4 h-4" />}
+                        <span className="font-bold text-xs md:text-sm uppercase tracking-tight truncate mr-2">{channel.name}</span>
+                        {restrictedChannels.includes(channel.id) && <LogIn className="w-3 h-3 md:w-4 md:h-4" />}
                       </button>
                     ))}
                   </div>
                 </section>
 
-                <section className="space-y-4 border-t border-white/10 pt-8">
-                  <h3 className="text-white font-bold uppercase tracking-widest text-xs">Update Parental PIN</h3>
-                  <div className="flex gap-4">
+                <section className="space-y-3 md:space-y-4 border-t border-white/10 pt-6 md:pt-8">
+                  <h3 className="text-white font-bold uppercase tracking-widest text-[8px] md:text-xs">Update Parental PIN</h3>
+                  <div className="flex gap-3 md:gap-4">
                     <input 
                       type="password"
                       placeholder="New 4-digit PIN"
                       maxLength={4}
-                      className="flex-1 bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white outline-none focus:border-white/20 transition-all font-mono"
+                      className="flex-1 bg-white/5 border border-white/10 rounded-lg md:rounded-xl px-3 md:px-4 py-2 md:py-3 text-xs md:text-sm text-white outline-none focus:border-white/20 transition-all font-mono"
                       onKeyDown={(e) => {
                         if (e.key === 'Enter') {
                           updateParentalPin((e.target as HTMLInputElement).value);
@@ -2729,7 +2798,7 @@ export default function App() {
                         updateParentalPin(input.value);
                         input.value = '';
                       }}
-                      className="px-6 py-3 bg-white text-black font-black rounded-xl uppercase tracking-widest text-[10px]"
+                      className="px-4 md:px-6 py-2 md:py-3 bg-white text-black font-black rounded-lg md:rounded-xl uppercase tracking-widest text-[8px] md:text-[10px]"
                     >
                       Update
                     </button>
@@ -2749,8 +2818,11 @@ export default function App() {
           background: transparent;
         }
         .custom-scrollbar::-webkit-scrollbar-thumb {
-          background: rgba(255, 255, 255, 0.1);
+          background: rgba(255, 255, 255, 0.3);
           border-radius: 10px;
+        }
+        .scrollbar-visible::-webkit-scrollbar-thumb {
+          background: rgba(255, 255, 255, 0.6);
         }
         .no-scrollbar::-webkit-scrollbar {
           display: none;
@@ -2771,20 +2843,20 @@ export default function App() {
       )}
 
       {/* YouTube Attribution Footer */}
-      <div className="fixed bottom-0 left-0 right-0 bg-black/90 backdrop-blur-xl border-t border-white/5 py-4 px-10 z-[70]">
-        <div className="max-w-4xl mx-auto flex items-center justify-center gap-4 flex-wrap">
-          <div className="flex items-center gap-3">
+      <div className="fixed bottom-0 left-0 right-0 bg-transparent py-3 md:py-4 px-4 md:px-10 z-[70]">
+        <div className="max-w-4xl mx-auto flex items-center justify-center gap-2 md:gap-4 flex-wrap">
+          <div className="flex items-center gap-2 md:gap-3">
             <img 
               src="https://www.youtube.com/img/desktop/yt_1200.png" 
               alt="YouTube" 
-              className="h-4 opacity-50"
+              className="h-3 md:h-4 opacity-50"
               referrerPolicy="no-referrer"
             />
-            <div className="text-[9px] text-white/40 font-bold uppercase tracking-[0.2em] text-center">
+            <div className="text-[7px] md:text-[9px] text-white/40 font-bold uppercase tracking-[0.1em] md:tracking-[0.2em] text-center">
               YouTV is not affiliated with YouTube or Google. This app uses YouTube API Services.
             </div>
           </div>
-          <div className="flex items-center gap-4 text-[8px] font-black uppercase tracking-widest text-white/20">
+          <div className="flex items-center gap-3 md:gap-4 text-[7px] md:text-[8px] font-black uppercase tracking-widest text-white/20">
             <a href="https://www.youtube.com/t/terms" target="_blank" className="hover:text-white transition-colors">YouTube Terms</a>
             <a href="https://policies.google.com/privacy" target="_blank" className="hover:text-white transition-colors">Google Privacy</a>
           </div>
