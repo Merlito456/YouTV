@@ -68,6 +68,17 @@ export default function App() {
   const [showChannelNumber, setShowChannelNumber] = useState(false);
   const [isBuffering, setIsBuffering] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
+  const isSyncingRef = useRef(false);
+  const currentChannelRef = useRef<Channel | null>(null);
+
+  useEffect(() => {
+    currentChannelRef.current = currentChannel;
+  }, [currentChannel]);
+
+  const updateIsSyncing = (val: boolean) => {
+    setIsSyncing(val);
+    isSyncingRef.current = val;
+  };
   const [showComplianceModal, setShowComplianceModal] = useState(false);
   const [complianceType, setComplianceType] = useState<'privacy' | 'terms' | 'deletion' | 'report'>('privacy');
   const [isAgeVerified, setIsAgeVerified] = useState<boolean>(() => {
@@ -193,228 +204,18 @@ export default function App() {
     return () => subscription.unsubscribe();
   }, []);
 
-  const syncLiveStatus = useCallback(async (force = false) => {
-    if (isSyncing) return;
-    setIsSyncing(true);
-    setError(null);
-    
-    let syncCount = 0;
-    let liveCount = 0;
-    const MAX_SYNC_PER_CYCLE = 10; // Limit syncs per cycle to save quota
-    const SYNC_COOLDOWN = 2 * 60 * 1000; // 2 minutes cooldown per channel
-    
-    const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-    
-    try {
-      console.log(`Starting live sync (force=${force})...`);
-      // Get all channels to ensure we have the latest state
-      const { data: allChannels } = await supabase.from('channels').select('*');
-      if (!allChannels) {
-        console.log("No channels found in database.");
-        setIsSyncing(false);
-        return;
-      }
-
-      // Group channels by their source ID (channel_id, username, or query)
-      // This helps us identify which channels belong to the same "source"
-      const sourceGroups: { [key: string]: Channel[] } = {};
-      allChannels.forEach(c => {
-        const sourceId = c.channel_id || c.username || c.query;
-        if (sourceId) {
-          if (!sourceGroups[sourceId]) sourceGroups[sourceId] = [];
-          sourceGroups[sourceId].push(c);
-        }
-      });
-
-      // Sort source groups by last_live_check to prioritize stale channels
-      const sortedSourceIds = Object.keys(sourceGroups).sort((a, b) => {
-        const lastA = sourceGroups[a][0].last_live_check ? new Date(sourceGroups[a][0].last_live_check).getTime() : 0;
-        const lastB = sourceGroups[b][0].last_live_check ? new Date(sourceGroups[b][0].last_live_check).getTime() : 0;
-        return lastA - lastB;
-      });
-
-      for (const sourceId of sortedSourceIds) {
-        if (syncCount >= MAX_SYNC_PER_CYCLE && !force) {
-          console.log(`Reached max sync limit (${MAX_SYNC_PER_CYCLE}) for this cycle. Stopping.`);
-          break;
-        }
-
-        const relatedChannels = sourceGroups[sourceId].sort((a, b) => 
-          new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-        );
-        
-        const mainChannel = relatedChannels[0];
-        const relatedIds = relatedChannels.map(c => c.id);
-        
-        // --- QUOTA SAVING LOGIC ---
-        // 1. Check cooldown
-        const lastCheck = mainChannel.last_live_check ? new Date(mainChannel.last_live_check).getTime() : 0;
-        const timeSinceLastCheck = Date.now() - lastCheck;
-        if (!force && timeSinceLastCheck < SYNC_COOLDOWN) {
-          console.log(`Skipping ${mainChannel.name} (checked ${Math.round(timeSinceLastCheck / 1000)}s ago, cooldown is 10m)`);
-          continue;
-        }
-
-        // 2. Check if ANY of the related channels already have a live_video_id
-        const liveChannel = relatedChannels.find(c => c.is_live && c.live_video_id);
-        
-        if (!force && liveChannel && liveChannel.live_video_id) {
-          // CHEAP CHECK: Is it still live? (1 unit)
-          console.log(`Checking if existing live stream for ${mainChannel.name} is still active: ${liveChannel.live_video_id}`);
-          const stillLive = await isVideoLive(liveChannel.live_video_id);
-          
-          if (stillLive) {
-            console.log(`Live stream for ${mainChannel.name} is still active. Skipping search.`);
-            liveCount++;
-            // Update last_live_check for all related channels
-            await supabase.from('channels').update({ last_live_check: new Date().toISOString() }).in('id', relatedIds);
-            continue;
-          } else {
-            console.log(`Live stream for ${mainChannel.name} has ended. Will search for new streams.`);
-            // Mark it as not live so we can search again
-            await supabase.from('channels').update({ is_live: false, live_video_id: null }).eq('id', liveChannel.id);
-            liveChannel.is_live = false;
-            liveChannel.live_video_id = undefined;
-          }
-        }
-        
-        // 3. Check for fallback programs (not "LIVE BROADCAST") for the main channel
-        const { data: fallbackPrograms } = await supabase
-          .from('programs')
-          .select('id')
-          .eq('channel_id', mainChannel.id)
-          .neq('title', 'LIVE BROADCAST')
-          .limit(1);
-
-        const hasFallback = fallbackPrograms && fallbackPrograms.length > 0;
-
-        // Only trigger sync if both live videos and fallback programs are not available
-        // Exception: Priority channels like Kapamilya should always be scanned if they are currently live
-        const isPriority = mainChannel.name.toLowerCase().includes('kapamilya');
-        
-        if (!force && !isPriority && hasFallback) {
-          console.log(`Skipping sync for ${mainChannel.name} (has fallback programs)`);
-          // Update last_live_check for all related channels
-          await supabase.from('channels').update({ last_live_check: new Date().toISOString() }).in('id', relatedIds);
-          continue;
-        }
-        
-        // RATE LIMITING: Wait 1 second before each search (100 units)
-        if (syncCount > 0) await delay(1000);
-
-        console.log(`Searching for live streams for ${mainChannel.name} using sourceId: ${sourceId}...`);
-        const { videoIds, resolvedChannelId } = await detectLiveVideoIds(sourceId);
-        // Unique the IDs to prevent duplicates
-        const uniqueVideoIds = Array.from(new Set(videoIds));
-        
-        syncCount++;
-        
-        // Update last_live_check and potentially resolvedChannelId for all related channels
-        const updateData: any = { last_live_check: new Date().toISOString() };
-        if (resolvedChannelId && !mainChannel.channel_id) {
-          updateData.channel_id = resolvedChannelId;
-        }
-        await supabase.from('channels').update(updateData).in('id', relatedIds);
-
-        if (uniqueVideoIds.length > 0) {
-          console.log(`Found ${uniqueVideoIds.length} live stream(s) for ${mainChannel.name}`);
-          
-          for (let i = 0; i < uniqueVideoIds.length; i++) {
-            const liveVideoId = uniqueVideoIds[i];
-            const channelName = uniqueVideoIds.length > 1 ? `${mainChannel.name.replace(/\s\d+$/, '')} ${i + 1}` : mainChannel.name.replace(/\s\d+$/, '');
-            
-            let targetChannelId = null;
-            
-            if (i < relatedChannels.length) {
-              // Reuse existing channel
-              targetChannelId = relatedChannels[i].id;
-              await supabase.from('channels').update({
-                name: channelName,
-                is_live: true,
-                live_video_id: liveVideoId,
-                last_live_check: new Date().toISOString()
-              }).eq('id', targetChannelId);
-            } else {
-              // Create new channel for additional live stream
-              const { data: newChannel } = await supabase.from('channels').insert({
-                name: channelName,
-                channel_id: mainChannel.channel_id,
-                username: mainChannel.username,
-                query: mainChannel.query,
-                playlist_id: mainChannel.playlist_id,
-                is_live: true,
-                live_video_id: liveVideoId,
-                order_index: mainChannel.order_index,
-                last_live_check: new Date().toISOString()
-              }).select().single();
-              
-              if (newChannel) {
-                targetChannelId = newChannel.id;
-              }
-            }
-            
-            if (targetChannelId) {
-              // Ensure we have a "LIVE BROADCAST" program for this channel
-              const { data: existingLive } = await supabase
-                .from('programs')
-                .select('id')
-                .eq('channel_id', targetChannelId)
-                .eq('title', 'LIVE BROADCAST')
-                .limit(1);
-                
-              if (!existingLive || existingLive.length === 0) {
-                await addProgram(targetChannelId, 'LIVE BROADCAST', liveVideoId, 'Live stream');
-              } else {
-                // Update existing live program with new video ID
-                await supabase.from('programs').update({ video_id: liveVideoId }).eq('id', existingLive[0].id);
-              }
-            }
-          }
-          
-          // If we have fewer live streams than related channels, mark the rest as not live
-          if (uniqueVideoIds.length < relatedChannels.length) {
-            const remainingIds = relatedChannels.slice(uniqueVideoIds.length).map(c => c.id);
-            await supabase.from('channels').update({
-              is_live: false,
-              live_video_id: null,
-              last_live_check: new Date().toISOString()
-            }).in('id', remainingIds);
-          }
-          
-          liveCount++;
-        } else {
-          console.log(`No live streams found for ${mainChannel.name}`);
-          // Update last_live_check and mark as not live
-          await supabase.from('channels').update({
-            is_live: false,
-            live_video_id: null,
-            last_live_check: new Date().toISOString()
-          }).in('id', relatedIds);
-        }
-        
-        // Small delay between sources to avoid rate limits
-        await delay(500);
-      }
-      
-      console.log(`Live sync completed. Found ${liveCount} live sources.`);
-      if (liveCount > 0) {
-        // Refresh channels state
-        const { data: updatedChannels } = await supabase.from('channels').select('*').order('order_index', { ascending: true });
-        if (updatedChannels) setChannels(updatedChannels);
-      }
-    } catch (err) {
-      console.error("Error in syncLiveStatus:", err);
-      setError("Failed to sync live status. Check console for details.");
-    } finally {
-      setIsSyncing(false);
-    }
-  }, [isSyncing]);
-
   const syncChannelPrograms = useCallback(async (channel: Channel) => {
     // Only sync programs if not live and no live video ID exists
     if (channel.is_live && channel.live_video_id) return;
 
     try {
+      // Clear old programs (older than 24 hours) to keep content fresh
+      const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      await supabase.from('programs')
+        .delete()
+        .eq('channel_id', channel.id)
+        .lt('created_at', oneDayAgo);
+
       // Get current programs
       const { data: current, error: fetchError } = await supabase
         .from('programs')
@@ -429,37 +230,304 @@ export default function App() {
 
       const needed = 10 - count;
 
+      // Ensure we have a channel_id if possible to prevent cross-playing
+      let targetChannelId = channel.channel_id;
+      if (!targetChannelId) {
+        console.log(`[Sync] Attempting to resolve missing channel_id for ${channel.name}...`);
+        const { resolvedChannelId } = await detectLiveVideoIds(channel.query || channel.username || channel.name);
+        if (resolvedChannelId) {
+          targetChannelId = resolvedChannelId;
+          // Update DB for future use
+          await supabase.from('channels').update({ channel_id: resolvedChannelId }).eq('id', channel.id);
+          // Update local object for immediate use
+          channel.channel_id = resolvedChannelId;
+        }
+      }
+
       // Fetch videos from YouTube
       let videos: any[] = [];
       if (channel.playlist_id) {
-        videos = await fetchPlaylistVideos(channel.playlist_id);
+        videos = (await fetchPlaylistVideos(channel.playlist_id)).map(v => ({ ...v, _source: 'playlist' }));
+      } else if (targetChannelId) {
+        videos = (await searchVideos(channel.query || '', 50, targetChannelId)).map(v => ({ ...v, _source: 'search' }));
       } else if (channel.query) {
-        videos = await searchVideos(channel.query);
-      } else if (channel.channel_id) {
-        videos = await searchVideos('', 50, channel.channel_id);
+        videos = (await searchVideos(channel.query)).map(v => ({ ...v, _source: 'search' }));
       }
 
       if (videos.length === 0) return;
 
-      // Shuffle videos for randomness as requested
-      const shuffled = [...videos].sort(() => Math.random() - 0.5);
+      // Filter by channel_id if available to prevent cross-playing
+      let filteredVideos = videos;
+      if (targetChannelId) {
+        filteredVideos = videos.filter(v => {
+          const videoChannelId = v._source === 'playlist' 
+            ? v.snippet?.videoOwnerChannelId 
+            : v.snippet?.channelId;
+          return videoChannelId === targetChannelId;
+        });
+        
+        if (filteredVideos.length === 0 && (channel.query || channel.name)) {
+          console.log(`[Sync] Playlist/Search returned no videos for ${channel.name}'s channel ID. Searching channel directly...`);
+          filteredVideos = await searchVideos(channel.query || channel.name, 50, targetChannelId);
+        }
+      }
 
-      for (let i = 0; i < needed; i++) {
-        const video = shuffled[i % shuffled.length];
+      if (filteredVideos.length === 0) {
+        console.warn(`[Sync] No videos found for ${channel.name} after filtering by channel ID.`);
+        return;
+      }
+
+      // Shuffle videos for randomness
+      const shuffled = [...filteredVideos].sort(() => Math.random() - 0.5);
+      const selectedVideos = shuffled.slice(0, needed);
+      
+      const videoIds = selectedVideos.map(v => v.id?.videoId || v.contentDetails?.videoId || (typeof v.id === 'string' ? v.id : null)).filter(Boolean);
+      if (videoIds.length === 0) return;
+
+      // Bulk fetch details for durations
+      const details = await getBatchVideoDetails(videoIds);
+      
+      const programsToInsert = selectedVideos.map(video => {
         const videoId = video.id?.videoId || video.contentDetails?.videoId || (typeof video.id === 'string' ? video.id : null);
-        if (!videoId) continue;
+        const detail = details.find(d => d.id === videoId);
+        const durationStr = detail?.contentDetails?.duration || 'PT10M';
+        const durationSeconds = parseISO8601Duration(durationStr);
+        
+        return {
+          channel_id: channel.id,
+          title: video.snippet.title,
+          video_id: videoId,
+          duration: durationSeconds,
+          description: video.snippet.description || ''
+        };
+      }).filter(p => p.video_id);
 
-        await addProgram(
-          channel.id,
-          video.snippet.title,
-          videoId,
-          video.snippet.description
-        );
+      if (programsToInsert.length > 0) {
+        const { error: insertError } = await supabase.from('programs').insert(programsToInsert);
+        if (insertError) throw insertError;
+        console.log(`[Sync] Bulk inserted ${programsToInsert.length} programs for ${channel.name}`);
       }
     } catch (err) {
       console.error("Error syncing channel programs:", err);
     }
   }, []);
+
+  const refreshChannelPrograms = useCallback(async (channel: Channel) => {
+    try {
+      console.log(`[Sync] Manually refreshing programs for ${channel.name}...`);
+      // 1. Clear all programs for this channel
+      const { error: deleteError } = await supabase
+        .from('programs')
+        .delete()
+        .eq('channel_id', channel.id);
+      
+      if (deleteError) throw deleteError;
+      
+      // 2. Trigger sync
+      await syncChannelPrograms(channel);
+      
+      // 3. If it's the current channel, clear currentProgram to force reload
+      if (currentChannelRef.current?.id === channel.id) {
+        setCurrentProgram(null);
+      }
+    } catch (err) {
+      console.error("Error refreshing channel programs:", err);
+    }
+  }, [syncChannelPrograms]);
+
+  // --- Fix DW History and Culture ---
+  useEffect(() => {
+    const fixDWChannel = async () => {
+      try {
+        console.log("[Fix] Starting DW History and Culture fix v2...");
+        const { data: channelsData, error: channelError } = await supabase
+          .from('channels')
+          .select('*')
+          .ilike('name', '%DW History and Culture%');
+        
+        if (channelError) throw channelError;
+        
+        if (channelsData && channelsData.length > 0) {
+          const dwChannel = channelsData[0];
+          console.log("[Fix] Found channel:", dwChannel.name, dwChannel.id);
+          
+          // 1. Clear current programs
+          const { error: deleteError } = await supabase
+            .from('programs')
+            .delete()
+            .eq('channel_id', dwChannel.id);
+          
+          if (deleteError) throw deleteError;
+          console.log("[Fix] Cleared programs for", dwChannel.name);
+          
+          // 2. Resolve correct channel ID
+          const { resolvedChannelId } = await detectLiveVideoIds('DW History and Culture');
+          console.log("[Fix] Resolved channel ID:", resolvedChannelId);
+          
+          if (resolvedChannelId) {
+            const { error: updateError } = await supabase
+              .from('channels')
+              .update({ 
+                channel_id: resolvedChannelId,
+                query: 'DW History and Culture',
+                is_live: false,
+                live_video_id: null,
+                last_live_check: null // Force a fresh check
+              })
+              .eq('id', dwChannel.id);
+            
+            if (updateError) throw updateError;
+            console.log("[Fix] Updated channel record.");
+            
+            // 3. Trigger sync
+            await syncChannelPrograms({ ...dwChannel, channel_id: resolvedChannelId });
+          }
+        } else {
+          console.warn("[Fix] DW History and Culture channel not found in database.");
+        }
+      } catch (err) {
+        console.error("[Fix] Error fixing DW channel:", err);
+      }
+    };
+    
+    // Run once
+    const hasFixed = localStorage.getItem('dw_fixed_v2');
+    if (!hasFixed) {
+      fixDWChannel().then(() => {
+        localStorage.setItem('dw_fixed_v2', 'true');
+      });
+    }
+  }, [syncChannelPrograms]);
+
+  const syncLiveStatus = useCallback(async (force = false, specificChannel?: Channel) => {
+    if (isSyncingRef.current) return;
+    
+    // ONLY sync what the user is watching (or a specific channel if provided)
+    const channelToSync = specificChannel || currentChannelRef.current;
+    if (!channelToSync) {
+      console.log("[Sync] No channel to sync (currentChannel is null).");
+      return;
+    }
+
+    // Rate limit: Skip if checked within the last 15 minutes (unless force)
+    const lastCheck = channelToSync.last_live_check ? new Date(channelToSync.last_live_check).getTime() : 0;
+    const now = Date.now();
+    const fifteenMinutes = 15 * 60 * 1000;
+    
+    if (!force && (now - lastCheck < fifteenMinutes)) {
+      console.log(`[Sync] ${channelToSync.name} was checked recently (${Math.round((now - lastCheck) / 60000)} mins ago). Skipping sync.`);
+      return;
+    }
+
+    updateIsSyncing(true);
+    setError(null);
+    
+    try {
+      console.log(`[Sync] Checking live status for ${channelToSync.name} (force=${force})...`);
+      
+      // 1. If it has a live_video_id, check if it's still valid
+      if (channelToSync.live_video_id && !force) {
+        const stillLive = await isVideoLive(channelToSync.live_video_id);
+        if (stillLive) {
+          console.log(`[Sync] ${channelToSync.name} is still live with ID ${channelToSync.live_video_id}`);
+          
+          // Update last_live_check even if still live
+          const checkTime = new Date().toISOString();
+          const { error: updateError } = await supabase.from('channels').update({ last_live_check: checkTime }).eq('id', channelToSync.id);
+          if (updateError) console.error("[Sync] Error updating last_live_check:", updateError);
+
+          if (currentChannelRef.current?.id === channelToSync.id) {
+            setCurrentChannel(prev => prev ? { ...prev, last_live_check: checkTime } : null);
+          }
+          
+          updateIsSyncing(false);
+          return;
+        }
+        console.log(`[Sync] ${channelToSync.name} live stream ${channelToSync.live_video_id} has ended.`);
+      }
+
+      // 2. Search for live streams (only if no live ID or invalid)
+      const sourceId = channelToSync.channel_id || channelToSync.username || channelToSync.query || channelToSync.name;
+      console.log(`[Sync] Searching for live streams for ${channelToSync.name} using sourceId: ${sourceId}...`);
+      const { videoIds, resolvedChannelId } = await detectLiveVideoIds(sourceId);
+      
+      const checkTime = new Date().toISOString();
+
+      if (videoIds.length > 0) {
+        const liveVideoId = videoIds[0];
+        console.log(`[Sync] Found new live stream for ${channelToSync.name}: ${liveVideoId}`);
+        
+        // Update database
+        const updateData: any = {
+          is_live: true,
+          live_video_id: liveVideoId,
+          last_live_check: checkTime
+        };
+        if (resolvedChannelId && !channelToSync.channel_id) {
+          updateData.channel_id = resolvedChannelId;
+        }
+        
+        const { error: updateError } = await supabase.from('channels').update(updateData).eq('id', channelToSync.id);
+        if (updateError) console.error("[Sync] Error updating channel live status:", updateError);
+        
+        // Update local state if it's the current channel
+        if (currentChannelRef.current?.id === channelToSync.id) {
+          setCurrentChannel(prev => prev ? { 
+            ...prev, 
+            is_live: true, 
+            live_video_id: liveVideoId,
+            channel_id: resolvedChannelId || prev.channel_id,
+            last_live_check: checkTime
+          } : null);
+        }
+
+        // Ensure "LIVE BROADCAST" program exists
+        const programChannelId = channelToSync.id;
+        const { data: existingLive } = await supabase
+          .from('programs')
+          .select('id')
+          .eq('channel_id', programChannelId)
+          .eq('title', 'LIVE BROADCAST')
+          .limit(1);
+          
+        if (!existingLive || existingLive.length === 0) {
+          await addProgram(programChannelId, 'LIVE BROADCAST', liveVideoId, 'Live stream');
+        } else {
+          await supabase.from('programs').update({ video_id: liveVideoId }).eq('id', existingLive[0].id);
+        }
+      } else {
+        // No live streams found - verified
+        console.log(`[Sync] No live streams found for ${channelToSync.name}. Applying fallback.`);
+        
+        // Mark as not live
+        const { error: updateError } = await supabase.from('channels').update({
+          is_live: false,
+          live_video_id: null,
+          last_live_check: checkTime
+        }).eq('id', channelToSync.id);
+        if (updateError) console.error("[Sync] Error updating channel fallback status:", updateError);
+
+        if (currentChannelRef.current?.id === channelToSync.id) {
+          setCurrentChannel(prev => prev ? { ...prev, is_live: false, live_video_id: null, last_live_check: checkTime } : null);
+          // Clear current program to force EPG loop to re-evaluate for fallback
+          setCurrentProgram(null);
+        }
+
+        // Trigger fallback sync (syncChannelPrograms handles adding programs from DB/YouTube)
+        await syncChannelPrograms(channelToSync);
+      }
+      
+      // Refresh channels list to reflect changes in UI (e.g. live badges)
+      const { data: updatedChannels } = await supabase.from('channels').select('*').order('name', { ascending: true });
+      if (updatedChannels) setChannels(updatedChannels);
+      
+    } catch (err) {
+      console.error("[Sync] Error in syncLiveStatus:", err);
+      setError("Failed to sync live status.");
+    } finally {
+      updateIsSyncing(false);
+    }
+  }, [syncChannelPrograms]);
 
   const handleChannelChange = useCallback((channel: Channel) => {
     setLastInteractionTime(Date.now());
@@ -474,6 +542,12 @@ export default function App() {
       }
     }
     
+    // Reset state for new channel to force player update
+    setCurrentProgram(null);
+    if (player && player.stopVideo) {
+      player.stopVideo();
+    }
+    setPrograms([]);
     setIsZapping(true);
     setShowChannelNumber(true);
     setCurrentChannel(channel);
@@ -481,15 +555,19 @@ export default function App() {
     setShowChannelList(false);
     
     // Refresh EPG for the new channel immediately
-    if (!channel.is_live && !channel.live_video_id) {
+    // If no live video ID, we definitely need programs as fallback
+    if (!channel.live_video_id) {
       syncChannelPrograms(channel).then(() => {
-        // If still no programs after sync, try live sync
-        supabase.from('programs').select('id').eq('channel_id', channel.id).limit(1).then(({ data }) => {
-          if (!data || data.length === 0) {
-            syncLiveStatus();
-          }
-        });
+        // If still no programs after sync, and it's supposed to be live, try live sync
+        if (channel.is_live) {
+          syncLiveStatus(false, channel);
+        }
       });
+    } else {
+      // Even if it has a live video ID, sync programs in background for EPG/fallback
+      syncChannelPrograms(channel);
+      // ALSO check if the live video ID is still valid (selective sync)
+      syncLiveStatus(false, channel);
     }
 
     // Clear zapping effect after 1.5s
@@ -498,7 +576,7 @@ export default function App() {
     // Auto-hide channel number after 3s
     if (channelNumberTimeoutRef.current) clearTimeout(channelNumberTimeoutRef.current);
     channelNumberTimeoutRef.current = setTimeout(() => setShowChannelNumber(false), 3000);
-  }, [currentChannel, restrictedChannels, parentalPin, syncChannelPrograms, syncLiveStatus]);
+  }, [currentChannel, restrictedChannels, parentalPin, syncChannelPrograms, syncLiveStatus, player]);
 
   const adjustVolume = useCallback((delta: number) => {
     if (!player) return;
@@ -835,6 +913,7 @@ export default function App() {
         channel_id: c.channel_id,
         is_live: c.is_live || false,
         live_video_id: c.live_video_id,
+        last_live_check: c.last_live_check,
         created_at: c.created_at
       } as Channel));
 
@@ -902,8 +981,10 @@ export default function App() {
   }, [currentChannel]);
 
   const scheduledPrograms = useMemo<ScheduledProgram[]>(() => {
+    if (!currentChannel) return [];
+
     // If channel is live and has a live_video_id, that's the only program
-    if (currentChannel?.is_live && currentChannel?.live_video_id) {
+    if (currentChannel.is_live && currentChannel.live_video_id) {
       const now = new Date();
       return [{
         id: 'live-' + currentChannel.id,
@@ -917,9 +998,25 @@ export default function App() {
       }];
     }
 
-    if (programs.length === 0) return [];
-    const sorted = [...programs].sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
-    let lastEndTime = new Date(sorted[0].created_at);
+    // Filter programs by current channel ID to prevent showing old channel data
+    const channelPrograms = programs.filter(p => p.channel_id === currentChannel.id);
+    if (channelPrograms.length === 0) return [];
+
+    const sorted = [...channelPrograms].sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+    
+    // Calculate total duration to support looping
+    const totalDuration = sorted.reduce((acc, p) => acc + p.duration, 0);
+    if (totalDuration === 0) return [];
+
+    const now = new Date();
+    // Use the first program's created_at as the anchor for the loop
+    const anchorTime = new Date(sorted[0].created_at).getTime();
+    const elapsedSeconds = (now.getTime() - anchorTime) / 1000;
+    
+    // Calculate the start of the current loop iteration that includes "now"
+    const loopOffset = Math.floor(elapsedSeconds / totalDuration) * totalDuration;
+    let lastEndTime = new Date(anchorTime + loopOffset * 1000);
+
     return sorted.map(p => {
       const start = lastEndTime;
       const end = new Date(start.getTime() + p.duration * 1000);
@@ -931,7 +1028,15 @@ export default function App() {
   // --- EPG Logic ---
   useEffect(() => {
     const interval = setInterval(() => {
-      if (scheduledPrograms.length === 0) return;
+      if (scheduledPrograms.length === 0) {
+        if (currentProgram !== null) {
+          setCurrentProgram(null);
+          if (player && player.stopVideo) {
+            player.stopVideo();
+          }
+        }
+        return;
+      }
       
       const now = new Date();
       const active = scheduledPrograms.find(p => isWithinInterval(now, { start: p.start, end: p.end }));
@@ -971,25 +1076,40 @@ export default function App() {
   }, [scheduledPrograms, currentProgram, player, hasInteracted, isMuted]);
 
   // --- Periodic Live Sync ---
+  const lastSyncedChannelId = useRef<string | null>(null);
+  const syncLiveStatusRef = useRef(syncLiveStatus);
+
+  useEffect(() => {
+    syncLiveStatusRef.current = syncLiveStatus;
+  }, [syncLiveStatus]);
+
   useEffect(() => {
     // Sync every 15 minutes
     const interval = setInterval(() => {
-      syncLiveStatus();
+      if (currentChannelRef.current) {
+        syncLiveStatusRef.current(false, currentChannelRef.current);
+      }
     }, 15 * 60 * 1000);
 
-    // Initial sync after 2 seconds to let data load
-    const timeout = setTimeout(() => {
-      syncLiveStatus();
-    }, 2000);
+    // Initial sync after 2 seconds when switching channels
+    if (currentChannel?.id && currentChannel.id !== lastSyncedChannelId.current) {
+      const timeout = setTimeout(() => {
+        if (currentChannelRef.current) {
+          syncLiveStatusRef.current(false, currentChannelRef.current);
+          lastSyncedChannelId.current = currentChannelRef.current.id;
+        }
+      }, 2000);
+      return () => {
+        clearInterval(interval);
+        clearTimeout(timeout);
+      };
+    }
 
-    return () => {
-      clearInterval(interval);
-      clearTimeout(timeout);
-    };
-  }, []); // Empty dependency array to prevent infinite loops
+    return () => clearInterval(interval);
+  }, [currentChannel?.id]);
 
   useEffect(() => {
-    if (hasInteracted && !currentProgram && scheduledPrograms.length > 0) {
+    if (!currentProgram && scheduledPrograms.length > 0) {
       const now = new Date();
       const active = scheduledPrograms.find(p => isWithinInterval(now, { start: p.start, end: p.end }));
       if (active) {
@@ -999,7 +1119,7 @@ export default function App() {
             videoId: active.video_id,
             startSeconds: calculateStartTime(active.start, active.title)
           });
-          if (!isMuted) {
+          if (hasInteracted && !isMuted) {
             player.unMute();
           } else {
             player.mute();
@@ -1008,7 +1128,7 @@ export default function App() {
         }
       }
     }
-  }, [hasInteracted, scheduledPrograms, player]);
+  }, [hasInteracted, scheduledPrograms, player, currentProgram, isMuted]);
 
   // --- Overlay Visibility on Interaction ---
   useEffect(() => {
@@ -1368,7 +1488,20 @@ export default function App() {
   const getScheduledProgramsForChannel = useCallback((channelId: string, channelPrograms: Program[]): ScheduledProgram[] => {
     if (channelPrograms.length === 0) return [];
     const sorted = [...channelPrograms].sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
-    let lastEndTime = new Date(sorted[0].created_at);
+    
+    // Calculate total duration to support looping
+    const totalDuration = sorted.reduce((acc, p) => acc + p.duration, 0);
+    if (totalDuration === 0) return [];
+
+    const now = new Date();
+    // Use the first program's created_at as the anchor for the loop
+    const anchorTime = new Date(sorted[0].created_at).getTime();
+    const elapsedSeconds = (now.getTime() - anchorTime) / 1000;
+    
+    // Calculate the start of the current loop iteration that includes "now"
+    const loopOffset = Math.floor(elapsedSeconds / totalDuration) * totalDuration;
+    let lastEndTime = new Date(anchorTime + loopOffset * 1000);
+
     return sorted.map(p => {
       const start = lastEndTime;
       const end = new Date(start.getTime() + p.duration * 1000);
@@ -1378,7 +1511,7 @@ export default function App() {
   }, []);
 
   const getActiveProgramForChannel = useCallback((channelId: string): ScheduledProgram | undefined => {
-    const channelPrograms = programs.filter(p => p.channel_id === channelId);
+    const channelPrograms = programs.filter(p => p.channel_id === (channelId || ''));
     const scheduled = getScheduledProgramsForChannel(channelId, channelPrograms);
     const now = new Date();
     return scheduled.find(p => isWithinInterval(now, { start: p.start, end: p.end }));
@@ -2152,8 +2285,9 @@ export default function App() {
               className="flex-1 overflow-y-auto space-y-8 md:space-y-12 pr-4 -mr-4 custom-scrollbar"
             >
               {channels.map((channel, idx) => {
-                const channelPrograms = programs.filter(p => p.channel_id === channel.id);
-                const scheduled = getScheduledProgramsForChannel(channel.id, channelPrograms);
+                const programId = channel.id;
+                const channelPrograms = programs.filter(p => p.channel_id === programId);
+                const scheduled = getScheduledProgramsForChannel(programId, channelPrograms);
                 const isFocused = focusedChannelIndex === idx;
                 return (
                   <div key={channel.id} className={cn(
@@ -2509,6 +2643,13 @@ export default function App() {
                             )}
                           </div>
                           <div className="flex items-center gap-2">
+                            <button 
+                              onClick={() => refreshChannelPrograms(c)}
+                              className="p-2 bg-white/5 hover:bg-white/10 rounded-xl text-white/40 hover:text-white transition-all"
+                              title="Clear & Refresh Programs"
+                            >
+                              <RefreshCw className="w-4 h-4" />
+                            </button>
                             <button 
                               onClick={() => toggleChannelLive(c.id, c.is_live)}
                               className={cn(
